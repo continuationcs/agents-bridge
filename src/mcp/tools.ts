@@ -35,6 +35,12 @@ export class ToolHub {
     return tools;
   }
 
+  /** Did the server mark this tool read-only? Unknown tools count as writes. */
+  async isReadOnly(server: string, tool: string): Promise<boolean> {
+    const t = (await this.listTools(server)).find((x) => x.name === tool);
+    return t?.annotations?.readOnlyHint === true;
+  }
+
   async callTool(server: string, tool: string, args: Record<string, unknown>) {
     const client = await this.client(server);
     return client.callTool({ name: tool, arguments: args });

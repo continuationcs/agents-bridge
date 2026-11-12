@@ -463,7 +463,7 @@ export class Bridge implements HubBackend {
     if (!this.router.allowsOutbound(ctx.agent, qualified)) {
       return { text: `${ctx.agent} is not routed to ${qualified}`, isError: true };
     }
-    const rule = this.policies.approvalFor(qualified);
+    const rule = this.policies.approvalFor(qualified, { readOnly: await this.tools.isReadOnly(server, tool) });
     if (rule) {
       const approvers = rule.approvers.map((a) => (a === 'initiator' ? ctx.envelope.initiator : a));
       const preview = JSON.stringify(args).slice(0, 500);

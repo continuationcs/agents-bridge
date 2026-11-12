@@ -29,8 +29,10 @@ export class PolicyEngine {
   }
 
   /** Approval needed before `tool` (as "server.tool") runs? Approvers are merged across matching policies. */
-  approvalFor(tool: string): ApprovalRule | undefined {
-    const hits = this.cfg.policies.filter((p) => p.approve_by?.length && anyGlob(p.match.tool, tool));
+  approvalFor(tool: string, opts: { readOnly?: boolean } = {}): ApprovalRule | undefined {
+    const hits = this.cfg.policies.filter(
+      (p) => p.approve_by?.length && anyGlob(p.match.tool, tool) && !(p.match.writes && opts.readOnly),
+    );
     if (!hits.length) return undefined;
     const approvers = [...new Set(hits.flatMap((p) => p.approve_by ?? []))];
     const timeouts = hits.map((p) => parseDuration(p.timeout ?? '10m'));
