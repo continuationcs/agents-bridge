@@ -16,6 +16,7 @@ import type { ImAdapter } from './adapters/im/types.ts';
 import { ToolHub } from './mcp/tools.ts';
 import { resolveSecret, setSecret } from './secrets.ts';
 import { TEMPLATE } from './template.ts';
+import { slackManifest } from './slack-manifest.ts';
 
 const HELP = `agents-bridge — connect agents to IM, to each other, and to tools
 
@@ -27,6 +28,7 @@ Usage: agents-bridge <command> [options]
   doctor                   check config, secrets, agents and tool servers
   routes explain           show which route a message would take
                              --from slack:#dev --sender alice [--text "..."] [--mention] [--dm]
+  slack manifest [name]    print a Slack app manifest (Socket Mode, DMs, channels)
   secret set <name>        store a secret in the OS keychain (value read from stdin)
   status                   show the running bridge
   sessions                 list recent sessions
@@ -96,6 +98,11 @@ async function main() {
         { personId: sender && cfg.people[sender] ? sender : undefined },
       );
       for (const line of trace) console.log(line);
+      return;
+    }
+    case 'slack': {
+      if (sub !== 'manifest') fail('usage: agents-bridge slack manifest [app name]');
+      process.stdout.write(slackManifest(arg));
       return;
     }
     case 'secret': {

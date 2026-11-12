@@ -145,6 +145,9 @@ export class Bridge implements HubBackend {
     const match = this.router.matchInbound(msg, { personId: person?.id, threadAgent: session?.agent });
     if (!match) {
       this.store.trace(key, 'ignored', person?.id ?? `${msg.platform}:${msg.userId}`, { text: msg.text });
+      if (!person && (msg.isDM || msg.mentioned)) {
+        this.log(`ignored ${msg.platform} user ${msg.userId} — not in people: (add  ${msg.platform}: ${msg.userId}  to a person)`);
+      }
       return;
     }
 
