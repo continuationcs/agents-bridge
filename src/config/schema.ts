@@ -20,11 +20,20 @@ const SlackConfig = z
   .object({ app_token: SecretRef, bot_token: SecretRef })
   .strict();
 const TelegramConfig = z.object({ bot_token: SecretRef }).strict();
+const FeishuConfig = z
+  .object({
+    app_id: z.string().min(1),
+    app_secret: SecretRef,
+    /** feishu = open.feishu.cn (China), lark = open.larksuite.com (international). */
+    domain: z.enum(['feishu', 'lark']).default('feishu'),
+  })
+  .strict();
 
 const ImConfig = z
   .object({
     slack: SlackConfig.optional(),
     telegram: TelegramConfig.optional(),
+    feishu: FeishuConfig.optional(),
   })
   .strict()
   .default({});
