@@ -1,6 +1,6 @@
 import { SocketModeClient } from '@slack/socket-mode';
 import { WebClient } from '@slack/web-api';
-import type { InboundMessage } from '../../core/router.ts';
+import type { InboundFile, InboundMessage } from '../../core/router.ts';
 import { toSlackMrkdwn } from './slack-format.ts';
 import type { Choice, ImAdapter, InboundAction, OutboundMessage } from './types.ts';
 
@@ -14,11 +14,13 @@ export class SlackAdapter implements ImAdapter {
   readonly maxTextLength = 3500;
   private readonly web: WebClient;
   private readonly socket: SocketModeClient;
+  private readonly botToken: string;
   private botUserId = '';
   private readonly channelNames = new Map<string, string>();
 
   constructor(opts: { appToken: string; botToken: string }) {
     this.web = new WebClient(opts.botToken);
+    this.botToken = opts.botToken;
     this.socket = new SocketModeClient({ appToken: opts.appToken });
   }
 
@@ -40,7 +42,9 @@ export class SlackAdapter implements ImAdapter {
     this.botUserId = String(auth.user_id);
     this.socket.on('message', async ({ event, ack }: { event: any; ack: () => Promise<void> }) => {
       await ack();
-      if (!event || event.subtype || event.bot_id || !event.user || event.user === this.botUserId) return;
+      // file_share is a normal message with attachments; other subtypes are edits, joins, bot posts…
+      const subtypeOk = !event?.subtype || event.subtype === 'file_share';
+      if (!event || !subtypeOk || event.bot_id || !event.user || event.user === this.botUserId) return;
       const mentionTag = `<@${this.botUserId}>`;
       const raw = String(event.text ?? '');
       const isDM = event.channel_type === 'im';
@@ -54,6 +58,7 @@ export class SlackAdapter implements ImAdapter {
         mentioned: raw.includes(mentionTag),
         threadId: event.thread_ts ?? event.ts,
         messageId: event.ts,
+        files: (event.files ?? []).map((f: any) => this.file(f)),
       });
     });
     await this.socket.start();
@@ -115,6 +120,26 @@ export class SlackAdapter implements ImAdapter {
 
   async edit(channelId: string, messageId: string, text: string) {
     await this.web.chat.update({ channel: channelId, ts: messageId, text: toSlackMrkdwn(text) });
+  }
+
+  /** Slack file → InboundFile; private URLs need the bot token (scope files:read). */
+  private file(f: any): InboundFile {
+    return {
+      name: String(f.name ?? f.title ?? f.id),
+      mime: f.mimetype,
+      size: typeof f.size === 'number' ? f.size : undefined,
+      download: async () => {
+        const url = f.url_private_download ?? f.url_private;
+        if (!url) throw new Error('no download URL (is the files:read scope granted?)');
+        const res = await fetch(url, { headers: { authorization: `Bearer ${this.botToken}` } });
+        if (!res.ok) throw new Error(`download failed: HTTP ${res.status}`);
+        // Without files:read Slack answers 200 with its HTML login page instead of the file.
+        if ((res.headers.get('content-type') ?? '').startsWith('text/html') && !String(f.mimetype).startsWith('text/html')) {
+          throw new Error('Slack returned a login page — grant the files:read scope and reinstall the app');
+        }
+        return Buffer.from(await res.arrayBuffer());
+      },
+    };
   }
 
   private async channelName(id: string): Promise<string> {

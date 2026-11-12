@@ -5,7 +5,7 @@ import { existsSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  ensureWorktree, listWorktrees, mergeBlocker, pushPullRequest, removeWorktree, squashMerge, worktreeStatus, type WorktreeOpts,
+  ensureWorktree, listWorktrees, mergeBlocker, pruneIdle, pushPullRequest, removeWorktree, squashMerge, worktreeStatus, type WorktreeOpts,
 } from '../src/adapters/agent/worktree.ts';
 import { parseConfig } from '../src/config/load.ts';
 import { Bridge } from '../src/core/bridge.ts';
@@ -165,4 +165,23 @@ exit 1
   } finally {
     process.env.PATH = oldPath;
   }
+});
+
+test('pruneIdle removes idle worktrees with nothing unmerged and keeps the rest', () => {
+  const { root, g, opts } = repo();
+  const dir = join(root, '..', `wts-prune-${Date.now()}`);
+  const mk = (key: string) => ensureWorktree({ ...opts(key), dir });
+  const empty = mk('slack:C1:empty');
+  const busy = mk('slack:C1:busy');
+  const active = mk('slack:C1:active');
+  writeFileSync(join(busy.path, 'x.txt'), 'x');
+  g(busy.path, 'add', '.');
+  g(busy.path, 'commit', '-qm', 'work');
+
+  const activeSlug = active.branch.replace('bridge/', '');
+  const removed = pruneIdle({ baseCwd: root, dir }, (slug) => slug !== activeSlug);
+  assert.deepEqual(removed, [empty.branch]);
+  assert.ok(!existsSync(empty.path));
+  assert.ok(existsSync(busy.path), 'unmerged work is kept');
+  assert.ok(existsSync(active.path), 'active conversation is kept');
 });

@@ -156,6 +156,20 @@ export function removeAt(root: string, path: string, branch: string) {
   tryGit(root, ['config', '--remove-section', `branch.${branch}`]);
 }
 
+/** Worktrees under `opts.baseCwd`'s repo that `isIdle` (by session slug) and hold no unmerged work. */
+export function pruneIdle(opts: Omit<WorktreeOpts, 'sessionKey'>, idleSlug: (slug: string) => boolean): string[] {
+  const removed: string[] = [];
+  for (const wt of listWorktrees(opts.baseCwd)) {
+    const slug = wt.branch.replace(/^bridge\//, '');
+    if (!idleSlug(slug)) continue;
+    const st = statusAt(wt.root, wt.path, wt.branch, opts.links);
+    if (st && (st.commits.length || st.dirty.length)) continue;
+    removeAt(wt.root, wt.path, wt.branch);
+    removed.push(wt.branch);
+  }
+  return removed;
+}
+
 /** Every bridge worktree of the repo containing `baseCwd`. */
 export function listWorktrees(baseCwd: string): { root: string; path: string; branch: string }[] {
   const root = tryGit(baseCwd, ['rev-parse', '--show-toplevel']);

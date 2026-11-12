@@ -17,6 +17,16 @@ export interface InboundMessage {
   /** Root message id of the thread this message belongs to (its own id if it starts one). */
   threadId: string;
   messageId: string;
+  /** Attachments; the bridge downloads them before the turn is queued. */
+  files?: InboundFile[];
+}
+
+export interface InboundFile {
+  name: string;
+  mime?: string;
+  /** Bytes, when the platform says. */
+  size?: number;
+  download(): Promise<Buffer>;
 }
 
 export interface InboundMatch {

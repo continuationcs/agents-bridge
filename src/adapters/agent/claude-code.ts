@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { createInterface } from 'node:readline';
 import type { AgentConfig } from '../../config/schema.ts';
 import type { AgentAdapter, AgentReply, AgentTurn, Workspace } from './types.ts';
@@ -11,6 +11,7 @@ import {
   expandHome,
   mergeBlocker,
   prBlocker,
+  pruneIdle,
   pushPullRequest,
   removeWorktree,
   squashMerge,
@@ -76,6 +77,8 @@ export class ClaudeCodeAgent implements AgentAdapter {
       '--allowedTools', ['mcp__bridge', ...this.cfg.allowed_tools].join(','),
     ];
     if (resume) args.push('--resume', resume);
+    // Attachments live outside the repo; let Claude read their folder.
+    for (const dir of new Set((turn.files ?? []).map((f) => dirname(f.path)))) args.push('--add-dir', dir);
     // Hard cap for this turn: whatever is left of the conversation budget.
     if (turn.budgetUsd !== undefined) args.push('--max-budget-usd', turn.budgetUsd.toFixed(2));
     if (this.cfg.model) args.push('--model', this.cfg.model);
@@ -126,7 +129,7 @@ export class ClaudeCodeAgent implements AgentAdapter {
           if (result) resolve(result);
           else reject(new Error(`claude exited with code ${code}${stderr ? `: ${stderr.trim()}` : ''}`));
         });
-        child.stdin.end(turn.text);
+        child.stdin.end(withFiles(turn));
       });
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -193,6 +196,10 @@ class WorktreeWorkspace implements Workspace {
     return lost.join('\n');
   }
 
+  prune(isIdle: (slug: string) => boolean) {
+    return pruneIdle(this.opts(''), isIdle);
+  }
+
   discard(key: string) {
     const st = worktreeStatus(this.opts(key));
     removeWorktree(this.opts(key));
@@ -217,6 +224,13 @@ function commitList(st: WorktreeStatus) {
 
 function fence(s: string) {
   return s ? '```\n' + s + '\n```' : '';
+}
+
+/** The prompt, plus where the attached files are (Claude Code reads images and documents with Read). */
+function withFiles(turn: AgentTurn): string {
+  if (!turn.files?.length) return turn.text;
+  const list = turn.files.map((f) => `- ${f.path} (${f.name}${f.mime ? `, ${f.mime}` : ''})`).join('\n');
+  return `${turn.text || 'See the attached files.'}\n\n[Attached by the person — read them with the Read tool]\n${list}`;
 }
 
 function describeToolUse(name: string, input: any): string {
