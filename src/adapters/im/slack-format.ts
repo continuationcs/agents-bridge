@@ -82,16 +82,16 @@ function inlinePlain(s: string): string {
   return s.replaceAll(BOLD, '*');
 }
 
-function isTableRow(line: string) {
+export function isTableRow(line: string) {
   const t = line.trim();
   return t.startsWith('|') && t.length > 1;
 }
 
-function isTableSeparator(line: string) {
+export function isTableSeparator(line: string) {
   return /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(line);
 }
 
-function cells(line: string): string[] {
+export function cells(line: string): string[] {
   return line
     .trim()
     .replace(/^\|/, '')
@@ -101,7 +101,7 @@ function cells(line: string): string[] {
 }
 
 /** Table cells go into a code block, so strip markdown that would show literally. */
-function plain(s: string): string {
+export function plain(s: string): string {
   return s
     .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
     .replace(/\*\*([^*]+)\*\*/g, '$1')

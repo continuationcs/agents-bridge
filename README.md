@@ -2,7 +2,7 @@
 
 One local process that connects **agents ↔ IM**, **agents ↔ agents** and **agents ↔ tools**, driven by a single `bridge.yaml`.
 
-- **IM**: Slack (Socket Mode) and Telegram (long polling). Both connect outbound, so you need no public URL.
+- **IM**: Slack (Socket Mode) and Feishu / Lark (long connection), both outbound so you need no public URL. Telegram (long polling) is written but not yet tested against the real service.
 - **Agents**: Claude Code (headless `claude -p`), any HTTP webhook, or any local process speaking JSON lines.
 - **Tools**: external MCP servers. The bridge connects to them with its own credentials and gives each agent only what its routes allow, with approvals where policies say so.
 - **Everything is routed and audited**: routes are first-match and deny-by-default, and every message, tool call and approval lands in a SQLite trace with secrets redacted.
@@ -63,6 +63,18 @@ node dist/cli.js up
 Approvals and merge/discard confirmations are Slack buttons (typed `approve` / `deny` / `yes` also work). A `budget_usd` policy is a per-conversation cap: each turn is started with only what is left (Claude Code gets it as `--max-budget-usd`).
 
 `bridge.yaml` is hot-reloaded. Changing IM credentials needs a restart.
+
+### Feishu / Lark
+
+```bash
+node dist/cli.js feishu setup   # app features, scopes to import, events and callbacks to subscribe
+```
+
+Replies are message cards (progress edits in place, approval buttons); headings and tables are rewritten for card markdown. People are mapped by open_id: `people: { alice: { feishu: ou_xxx } }` — `up` prints the open_id of anyone it ignores.
+
+### Attachments
+
+Files and images sent with a message are downloaded to `<data_dir>/files/<conversation>/` (up to `max_file_mb`, default 20) and handed to the agent as local paths; Claude Code is given read access to that folder. They are deleted after `files_ttl` (default 7d). Slack needs the `files:read` scope.
 
 ### Run it in the background (macOS)
 
@@ -128,7 +140,7 @@ src/
 
 ## Not in v0.1 yet
 
-- Discord and Feishu adapters
+- Discord adapter; Telegram tested end to end
 - Codex wrapper, A2A, webhook SSE streaming
 - Web UI (`status` serves JSON at `/api/status` for now)
 - Config-editing CLI commands (`connect`, `add`, `link`, `allow`); edit `bridge.yaml` directly

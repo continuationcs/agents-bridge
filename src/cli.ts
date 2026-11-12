@@ -13,6 +13,7 @@ import { Store } from './core/store.ts';
 import { LocalConsoleAdapter } from './adapters/im/local.ts';
 import { SlackAdapter } from './adapters/im/slack.ts';
 import { TelegramAdapter } from './adapters/im/telegram.ts';
+import { FeishuAdapter } from './adapters/im/feishu.ts';
 import type { ImAdapter } from './adapters/im/types.ts';
 import { ToolHub } from './mcp/tools.ts';
 import { resolveSecret, setSecret } from './secrets.ts';
@@ -33,6 +34,7 @@ Usage: agents-bridge <command> [options]
   routes explain           show which route a message would take
                              --from slack:#dev --sender alice [--text "..."] [--mention] [--dm]
   slack manifest [name]    print a Slack app manifest (Socket Mode, DMs, channels)
+  feishu setup             how to create the Feishu / Lark app, with the scopes to import
   secret set <name>        store a secret in the OS keychain (value read from stdin)
   service install|uninstall|restart|status
                            run the bridge in the background via launchd (macOS)
@@ -164,6 +166,11 @@ async function main() {
       if (!count) console.log(prune ? 'nothing to prune' : 'no conversation worktrees');
       return;
     }
+    case 'feishu': {
+      if (sub !== 'setup') fail('usage: agents-bridge feishu setup');
+      process.stdout.write(FEISHU_SETUP);
+      return;
+    }
     case 'slack': {
       if (sub !== 'manifest') fail('usage: agents-bridge slack manifest [app name]');
       process.stdout.write(slackManifest(arg));
@@ -243,6 +250,11 @@ function buildIms(cfg: BridgeConfig): ImAdapter[] {
     ims.push(new SlackAdapter({ appToken: resolveSecret(cfg.im.slack.app_token), botToken: resolveSecret(cfg.im.slack.bot_token) }));
   }
   if (cfg.im.telegram) ims.push(new TelegramAdapter({ botToken: resolveSecret(cfg.im.telegram.bot_token) }));
+  if (cfg.im.feishu) {
+    ims.push(
+      new FeishuAdapter({ appId: cfg.im.feishu.app_id, appSecret: resolveSecret(cfg.im.feishu.app_secret), domain: cfg.im.feishu.domain }),
+    );
+  }
   if (!ims.length) fail('no IM configured under im: — add one, or try "agents-bridge chat --as <person>"');
   return ims;
 }
@@ -330,6 +342,42 @@ function readSecretValue(prompt: string): Promise<string> {
     });
   });
 }
+
+const FEISHU_SETUP = `Feishu (open.feishu.cn/app) or Lark (open.larksuite.com/app) → Create custom app, then:
+
+1. Add features → Bot.
+2. Permissions & Scopes → batch import (批量导入/导出权限), paste:
+${JSON.stringify(
+  {
+    scopes: {
+      tenant: [
+        'im:message',
+        'im:message:send_as_bot',
+        'im:message.p2p_msg:readonly',
+        'im:message.group_at_msg:readonly',
+        'im:message.group_msg',
+        'im:resource',
+        'im:chat:readonly',
+      ],
+      user: [],
+    },
+  },
+  null,
+  2,
+)}
+   (im:message.group_msg is only needed for routes with \`listen: all\`.)
+3. Events & Callbacks:
+   - Event configuration → subscription mode: "Receive events through persistent connection" (长连接),
+     add event im.message.receive_v1.
+   - Callback configuration → same persistent-connection mode, add card.action.trigger.
+   (Start "agents-bridge up" first: the console only saves long-connection mode while a client is connected.)
+4. Version Management & Release → create a version and publish it (an admin may need to approve).
+5. Credentials & Basic Info → copy App ID and App Secret:
+     agents-bridge secret set feishu_app_secret
+   and in bridge.yaml:
+     im:
+       feishu: { app_id: cli_xxx, app_secret: secret:feishu_app_secret, domain: feishu }   # or lark
+`;
 
 function fail(msg: string): never {
   console.error(msg);
