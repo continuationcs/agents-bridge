@@ -97,7 +97,7 @@ function cells(line: string): string[] {
     .replace(/^\|/, '')
     .replace(/\|$/, '')
     .split(/(?<!\\)\|/)
-    .map((c) => plain(c.trim().replace(/\\\|/g, '|')));
+    .map((c) => c.trim().replace(/\\\|/g, '|'));
 }
 
 /** Table cells go into a code block, so strip markdown that would show literally. */
@@ -110,7 +110,38 @@ function plain(s: string): string {
     .replace(/<br\s*\/?>/gi, ' ');
 }
 
-function renderTable(rows: string[][]): string {
+/** Wider than this (in monospace columns) and a table would wrap in Slack, so rows become records. */
+const MAX_TABLE_WIDTH = 60;
+
+function renderTable(raw: string[][]): string {
+  const rows = raw.map((r) => r.map(plain));
+  const cols = Math.max(...rows.map((r) => r.length));
+  const total = Array.from({ length: cols }, (_, c) => Math.max(...rows.map((r) => width(r[c] ?? '')))).reduce(
+    (a, b) => a + b + 2,
+    0,
+  );
+  return total > MAX_TABLE_WIDTH ? renderRecords(raw) : renderGrid(rows);
+}
+
+/** One block per row: the first cell as a bold title, the rest as "header: value" bullets. */
+function renderRecords(rows: string[][]): string {
+  const [header, ...body] = rows;
+  const head = header!.map((h) => plain(h));
+  return body
+    .map((r) => {
+      const title = `*${inline(r[0] ?? '').replace(/\*/g, '')}*`;
+      const items = r.slice(1).flatMap((cell, i) => {
+        const parts = cell.split(/<br\s*\/?>/i).map((p) => inline(p.trim())).filter(Boolean);
+        const label = head[i + 1] ? `${head[i + 1]}: ` : '';
+        if (parts.length <= 1) return [`• ${label}${parts[0] ?? '—'}`];
+        return [`• ${label}`, ...parts.map((p) => `    ◦ ${p}`)];
+      });
+      return [title, ...items].join('\n');
+    })
+    .join('\n\n');
+}
+
+function renderGrid(rows: string[][]): string {
   const cols = Math.max(...rows.map((r) => r.length));
   const widths = Array.from({ length: cols }, (_, c) => Math.max(...rows.map((r) => width(r[c] ?? ''))));
   const fmt = (r: string[]) =>

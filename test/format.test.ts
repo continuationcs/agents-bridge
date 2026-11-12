@@ -37,3 +37,26 @@ test('split keeps code fences balanced', () => {
   for (const p of parts) assert.equal((p.match(/^```/gm) ?? []).length % 2, 0, p);
   assert.ok(parts.every((p) => p.length <= 120));
 });
+
+test('wide tables become one record per row', () => {
+  const md = [
+    '| 维度 | router.ts | policy.ts |',
+    '|---|---|---|',
+    '| 匹配方式 | 按顺序取第一个匹配（first-match），没有匹配就拒绝 | **所有**匹配的策略都生效，冲突时取最严格的值 |',
+    '| 公开方法 | `matchInbound`<br>`allowsOutbound` | `maxHops` |',
+  ].join('\n');
+  assert.equal(
+    toSlackMrkdwn(md),
+    [
+      '*匹配方式*',
+      '• router.ts: 按顺序取第一个匹配（first-match），没有匹配就拒绝',
+      '• policy.ts: *所有*匹配的策略都生效，冲突时取最严格的值',
+      '',
+      '*公开方法*',
+      '• router.ts: ',
+      '    ◦ `matchInbound`',
+      '    ◦ `allowsOutbound`',
+      '• policy.ts: `maxHops`',
+    ].join('\n'),
+  );
+});
