@@ -12,7 +12,8 @@ type ClaudeCodeConfig = Extract<AgentConfig, { type: 'claude-code' }>;
 const BRIDGE_PROMPT = `You are being reached through agents-bridge. Messages come from people in a chat app (Slack, Telegram, …) or from other agents.
 - Your final answer is posted back to the conversation automatically.
 - Use the "bridge" MCP tools to post an interim update (send_message), ask the person a question and wait for the reply (ask_human), hand work to another agent (delegate), or call the external tools you were granted.
-- Keep chat replies short and readable; the conversation is a chat thread, not a terminal.`;
+- Keep chat replies short and readable; the conversation is a chat thread, not a terminal.
+- Reply in the language the person writes in, even when bridge notes like this one are in English.`;
 
 /** Runs Claude Code headless (`claude -p`) per turn, resuming the same Claude session across turns of a thread. */
 export class ClaudeCodeAgent implements AgentAdapter {
