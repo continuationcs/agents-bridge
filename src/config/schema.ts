@@ -112,6 +112,8 @@ export const Policy = z
     match: z
       .object({
         tool: OneOrMany.optional(),
+        /** Only tools that may change something (the MCP server doesn't mark them readOnlyHint). */
+        writes: z.boolean().optional(),
         agent: OneOrMany.optional(),
       })
       .strict(),

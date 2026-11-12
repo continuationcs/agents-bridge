@@ -23,6 +23,7 @@ policies:
   - { match: { tool: ["github.push*", "*.delete*"] }, approve_by: [initiator, alice], timeout: 5m }
   - { match: { agent: "*" }, max_hops: 3, budget_usd: 2 }
   - { match: { agent: data-agent }, budget_usd: 0.5 }
+  - { match: { tool: "warehouse.*", writes: true }, approve_by: [alice] }
 `);
 const router = new Router(cfg);
 const msg = (o: Partial<InboundMessage>): InboundMessage => ({
@@ -82,4 +83,6 @@ test('policies: strictest wins, approvers merge', () => {
   assert.equal(a?.timeoutMs, 5 * 60e3);
   assert.equal(p.approvalFor('github.get_issue'), undefined);
   assert.ok(p.approvalFor('warehouse.delete_rows'));
+  assert.equal(p.approvalFor('warehouse.query', { readOnly: true }), undefined, 'reads skip a writes-only policy');
+  assert.deepEqual(p.approvalFor('warehouse.insert', { readOnly: false })?.approvers, ['alice']);
 });

@@ -46,7 +46,7 @@ routes:
   - from: claude-code
     to: [github.*, data-agent]
 policies:
-  - match: { tool: ["github.push*", "*.delete*"] }
+  - match: { tool: "github.*", writes: true }   # every GitHub tool not marked read-only
     approve_by: [initiator]
     timeout: 10m
   - match: { agent: "*" }
