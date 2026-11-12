@@ -289,3 +289,64 @@ test('budget: each turn gets what is left, and an exhausted budget stops the tur
     await bridge.stop();
   }
 });
+
+test('attachments are downloaded per conversation and handed to the agent; oversize ones are reported', async () => {
+  const { mkdtempSync, readFileSync, utimesSync, existsSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const filesDir = mkdtempSync(join(tmpdir(), 'ab-files-'));
+  const seen: AgentTurn[] = [];
+  const echo: AgentAdapter = { name: 'echo', async run(t) { seen.push(t); return { text: 'got it' }; } };
+  const im = new FakeIm();
+  const bridge = new Bridge({
+    cfg: parseConfig(yaml()), store: new Store(':memory:'), ims: [im], agents: new Map([['echo', echo]]), filesDir, log: () => {},
+  });
+  await bridge.start();
+  try {
+    im.receive({
+      userId: 'U1', text: 'what is in this?',
+      files: [
+        { name: 'shot.png', mime: 'image/png', size: 4, download: async () => Buffer.from('PNG!') },
+        { name: 'huge.zip', size: 50 * 1024 * 1024, download: async () => { throw new Error('should not download'); } },
+      ],
+    });
+    await bridge.idle();
+    const files = seen[0]!.files!;
+    assert.equal(files.length, 1);
+    assert.equal(files[0]!.name, 'shot.png');
+    assert.equal(readFileSync(files[0]!.path, 'utf8'), 'PNG!');
+    assert.match(im.transcript().join('\n'), /Couldn't pass along: huge\.zip \(over 20 MB\)/);
+
+    // older than files_ttl (7d) → removed by housekeeping
+    const old = Date.now() / 1000 - 8 * 86400;
+    utimesSync(files[0]!.path, old, old);
+    bridge.cleanUp();
+    assert.ok(!existsSync(files[0]!.path));
+  } finally {
+    await bridge.stop();
+  }
+});
+
+test('verbose progress lists the recent steps in the placeholder', async () => {
+  const echo: AgentAdapter = {
+    name: 'echo',
+    async run(t) {
+      for (const s of ['Read a.ts', 'Read b.ts', 'Edit a.ts']) t.onProgress?.(s);
+      await new Promise((r) => setTimeout(r, 1700));
+      return { text: 'done' };
+    },
+  };
+  const im = new FakeIm();
+  const cfg = parseConfig(yaml() + '\ndefaults: { progress: verbose }\n');
+  const bridge = new Bridge({ cfg, store: new Store(':memory:'), ims: [im], agents: new Map([['echo', echo]]), log: () => {} });
+  await bridge.start();
+  try {
+    im.receive({ userId: 'U1', text: 'go' });
+    await bridge.idle();
+    const edits = im.edits.map((e) => e.text);
+    assert.ok(edits.some((e) => /working \(3 steps\)\n• Read a\.ts\n• Read b\.ts\n• Edit a\.ts/.test(e)), edits.join('\n---\n'));
+    assert.equal(edits.at(-1), 'done');
+  } finally {
+    await bridge.stop();
+  }
+});

@@ -131,9 +131,23 @@ const Defaults = z
     offline_queue_ttl: z.string().default('24h'),
     progress: z.enum(['collapsed', 'verbose', 'off']).default('collapsed'),
     max_hops: z.number().int().positive().default(4),
+    /** Attachments larger than this are not downloaded. */
+    max_file_mb: z.number().positive().default(20),
+    /** Downloaded attachments are deleted after this long. */
+    files_ttl: z.string().default('7d'),
+    /** Idle conversation worktrees with nothing unmerged are removed after this long ("off" to keep). */
+    worktree_prune_after: z.string().default('7d'),
   })
   .strict()
-  .default({ dm_idle_reset: '2h', offline_queue_ttl: '24h', progress: 'collapsed', max_hops: 4 });
+  .default({
+    dm_idle_reset: '2h',
+    offline_queue_ttl: '24h',
+    progress: 'collapsed',
+    max_hops: 4,
+    max_file_mb: 20,
+    files_ttl: '7d',
+    worktree_prune_after: '7d',
+  });
 
 const Server = z
   .object({

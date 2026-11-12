@@ -6,6 +6,8 @@ export interface AgentTurn {
   text: string;
   /** The agent's own session id from the previous turn in this bridge session, if any. */
   agentSessionId?: string;
+  /** Files that came with this message, downloaded to local paths. */
+  files?: { name: string; path: string; mime?: string }[];
   /** USD left in this conversation's budget; agents should stop before spending more. */
   budgetUsd?: number;
   /** Session-scoped MCP endpoint the agent can call back into (send_message, ask_human, delegate, tools). */
@@ -35,6 +37,11 @@ export interface Workspace {
   /** What discarding would throw away ('' when there is nothing to lose). */
   previewDiscard(sessionKey: string): string | undefined;
   discard(sessionKey: string): string;
+  /**
+   * Remove worktrees whose conversation is idle and that hold nothing unmerged.
+   * `isIdle(slug)` decides (slug = sessionSlug(key)); returns the branches removed.
+   */
+  prune?(isIdle: (slug: string) => boolean): string[];
   /** Push the branch and open a pull request; absent when no git token is configured. */
   previewPr?(sessionKey: string): { ok: true; summary: string } | { ok: false; reason: string };
   pr?(sessionKey: string): string;

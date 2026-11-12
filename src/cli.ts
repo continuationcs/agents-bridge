@@ -209,7 +209,8 @@ async function run(configPath: string, ims: (cfg: BridgeConfig) => ImAdapter[], 
   const cfg = load(configPath);
   const store = openStore(cfg, configPath);
   const log = opts.quiet ? (l: string) => void (l.startsWith('inbound error') && console.error(l)) : (l: string) => console.log(l);
-  const bridge = new Bridge({ cfg, store, ims: ims(cfg), tools: new ToolHub(cfg.tools), log });
+  const filesDir = join(resolve(configPath, '..', cfg.server.data_dir), 'files');
+  const bridge = new Bridge({ cfg, store, ims: ims(cfg), tools: new ToolHub(cfg.tools), filesDir, log });
   const { mcpUrl } = await bridge.start();
   log(`agents-bridge up — MCP hub ${mcpUrl}, ${Object.keys(cfg.agents).length} agents, ${cfg.routes.length} routes`);
 

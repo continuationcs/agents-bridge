@@ -7,9 +7,13 @@ import { randomUUID } from 'node:crypto';
 import { McpHub, type HubBackend, type SessionGrant, type ToolResult } from '../mcp/hub.ts';
 import { ToolHub } from '../mcp/tools.ts';
 import { parseDuration } from './address.ts';
-import { minTrust, newEnvelope, type Envelope } from './envelope.ts';
+import { minTrust, newEnvelope, type ContentBlock, type Envelope } from './envelope.ts';
 import { PolicyEngine } from './policy.ts';
-import { Router, type InboundMessage } from './router.ts';
+import { Router, type InboundFile, type InboundMessage } from './router.ts';
+import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { sessionSlug } from '../adapters/agent/worktree.ts';
 import type { Store } from './store.ts';
 
 interface ThreadRef {
@@ -56,6 +60,8 @@ export interface BridgeOptions {
   /** Pre-built agents (tests); anything missing is built from cfg.agents. */
   agents?: Map<string, AgentAdapter>;
   tools?: ToolHub;
+  /** Where attachments are downloaded (default: a temp dir). */
+  filesDir?: string;
   log?: (line: string) => void;
 }
 
@@ -82,11 +88,15 @@ export class Bridge implements HubBackend {
   private readonly hub: McpHub;
   private readonly log: (line: string) => void;
   private readonly chains = new Map<string, Promise<void>>();
+  /** Inbound messages still being handled (e.g. downloading attachments) before they reach a chain. */
+  private readonly inflight = new Set<Promise<unknown>>();
   private readonly active = new Map<string, TurnCtx>();
   private readonly waiters = new Map<string, Waiter[]>();
   /** Open button choices by id: who may click, and how to settle them. */
   private readonly choices = new Map<string, { allowed: Set<string>; settle: (r: { by: string; value: string }) => void }>();
   private startedAt = 0;
+  private readonly filesDir: string;
+  private housekeeping?: NodeJS.Timeout;
 
   constructor(opts: BridgeOptions) {
     this.cfg = opts.cfg;
@@ -99,23 +109,28 @@ export class Bridge implements HubBackend {
     this.tools = opts.tools ?? new ToolHub(opts.cfg.tools);
     this.hub = new McpHub(this);
     this.log = opts.log ?? ((l) => console.log(l));
+    this.filesDir = opts.filesDir ?? join(tmpdir(), 'agents-bridge-files');
   }
 
   async start(): Promise<{ mcpUrl: string }> {
     const mcpUrl = await this.hub.listen(this.cfg.server.host, this.cfg.server.port);
     for (const im of this.ims.values()) {
       await im.start(
-        (msg) => this.handleInbound(msg).catch((e) => this.log(`inbound error: ${e?.stack ?? e}`)),
-        (action) => this.handleAction(action).catch((e) => this.log(`action error: ${e?.stack ?? e}`)),
+        (msg) => this.track(this.handleInbound(msg).catch((e) => this.log(`inbound error: ${e?.stack ?? e}`))),
+        (action) => this.track(this.handleAction(action).catch((e) => this.log(`action error: ${e?.stack ?? e}`))),
       );
       this.log(`connected ${im.platform}`);
     }
     this.startedAt = Date.now();
     this.replayQueue();
+    this.housekeeping = setInterval(() => this.cleanUp(), 6 * 3600e3);
+    this.housekeeping.unref();
+    setTimeout(() => this.cleanUp(), 60e3).unref();
     return { mcpUrl };
   }
 
   async stop() {
+    clearInterval(this.housekeeping);
     for (const im of this.ims.values()) await im.stop().catch(() => {});
     for (const a of this.agents.values()) await a.stop?.().catch(() => {});
     await this.tools.stop();
@@ -137,7 +152,14 @@ export class Bridge implements HubBackend {
 
   /** Wait until every queued turn has finished (tests, graceful shutdown). */
   async idle() {
-    while (this.chains.size) await Promise.allSettled([...this.chains.values()]);
+    while (this.chains.size || this.inflight.size) {
+      await Promise.allSettled([...this.inflight, ...this.chains.values()]);
+    }
+  }
+
+  private track(p: Promise<unknown>) {
+    this.inflight.add(p);
+    void p.finally(() => this.inflight.delete(p));
   }
 
   // ───────────────────────── inbound ─────────────────────────
@@ -195,7 +217,7 @@ export class Bridge implements HubBackend {
         displayName: msg.userName,
       },
       sessionKey: key,
-      content: [{ type: 'text', text: match.text }],
+      content: [{ type: 'text', text: match.text }, ...(await this.download(key, thread, msg.files ?? []))],
       trust,
       initiator: person?.id ?? `${msg.platform}:${msg.userId}`,
       hops: 0,
@@ -317,12 +339,26 @@ export class Bridge implements HubBackend {
     const progress = this.cfg.defaults.progress;
     const im = this.ims.get(thread.platform);
     const placeholder = progress !== 'off' && im ? await this.send(thread, `⏳ ${agent} is working…`) : undefined;
+    // collapsed: the placeholder shows the latest step. verbose: it lists the last steps.
     let lastEdit = 0;
+    let pending: NodeJS.Timeout | undefined;
+    const steps: string[] = [];
+    const render = () =>
+      progress === 'verbose'
+        ? `⏳ ${agent} is working (${steps.length} steps)\n${steps.slice(-8).map((s) => `• ${s}`).join('\n')}`
+        : `⏳ ${agent}: ${steps.at(-1)}`;
+    const flush = () => {
+      pending = undefined;
+      lastEdit = Date.now();
+      if (placeholder && im?.edit) void im.edit(thread.channelId, placeholder, render()).catch(() => {});
+    };
     const onProgress = (line: string) => {
       this.store.trace(sessionKey, 'progress', agent, { line });
-      if (!placeholder || !im?.edit || Date.now() - lastEdit < 1500) return;
-      lastEdit = Date.now();
-      void im.edit(thread.channelId, placeholder, `⏳ ${agent}: ${line}`).catch(() => {});
+      steps.push(line);
+      if (!placeholder || !im?.edit || pending) return;
+      const wait = 1500 - (Date.now() - lastEdit);
+      if (wait <= 0) flush();
+      else pending = setTimeout(flush, wait); // last step still shows even when steps arrive fast
     };
 
     const ctx: TurnCtx = { sessionKey, rootKey: sessionKey, agent, envelope: job.envelope, thread };
@@ -333,6 +369,7 @@ export class Bridge implements HubBackend {
           ? `[agents-bridge] Your previous turn was interrupted because the bridge restarted. Check what you had already done, then finish the original request:\n\n${job.text}`
           : job.text;
       const reply = await this.invoke(ctx, text, session.agent_session_id ?? undefined, onProgress);
+      clearTimeout(pending);
       await this.post(thread, reply.text || '(no reply)', placeholder);
       this.store.finish(job.envelope.id, 'done');
     } catch (err) {
@@ -358,6 +395,9 @@ export class Bridge implements HubBackend {
         text,
         agentSessionId,
         budgetUsd,
+        files: ctx.envelope.content.flatMap((b) =>
+          b.type === 'file' && b.path ? [{ name: b.name, path: b.path, mime: b.mime }] : [],
+        ),
         mcp: { url: grant.url, token: grant.token },
         onProgress,
         onSessionId: (id) => this.store.updateSession(ctx.sessionKey, { agent_session_id: id }),
@@ -370,6 +410,64 @@ export class Bridge implements HubBackend {
     } finally {
       grant.revoke();
       this.active.delete(ctx.sessionKey);
+    }
+  }
+
+  /** Save a message's attachments under filesDir/<conversation>/; oversize or failed ones are reported, not fatal. */
+  private async download(key: string, thread: ThreadRef, files: InboundFile[]): Promise<ContentBlock[]> {
+    if (!files.length) return [];
+    const max = this.cfg.defaults.max_file_mb * 1024 * 1024;
+    const dir = join(this.filesDir, sessionSlug(key));
+    mkdirSync(dir, { recursive: true });
+    const out: ContentBlock[] = [];
+    const skipped: string[] = [];
+    for (const f of files) {
+      if (f.size !== undefined && f.size > max) {
+        skipped.push(`${f.name} (over ${this.cfg.defaults.max_file_mb} MB)`);
+        continue;
+      }
+      try {
+        const data = await f.download();
+        if (data.length > max) throw new Error(`over ${this.cfg.defaults.max_file_mb} MB`);
+        const path = join(dir, `${Date.now()}-${f.name.replace(/[^\w.\-\u4e00-\u9fff]+/g, '_').slice(-120)}`);
+        writeFileSync(path, data);
+        out.push({ type: 'file', name: f.name, mime: f.mime, path });
+      } catch (err) {
+        skipped.push(`${f.name} (${(err as Error).message})`);
+      }
+    }
+    if (skipped.length) await this.send(thread, `⚠️ Couldn't pass along: ${skipped.join(', ')}`);
+    return out;
+  }
+
+  /** Periodic housekeeping: expire downloaded files, prune idle conversation worktrees. */
+  cleanUp() {
+    const ttl = parseDuration(this.cfg.defaults.files_ttl);
+    if (existsSync(this.filesDir)) {
+      for (const conv of readdirSync(this.filesDir)) {
+        const dir = join(this.filesDir, conv);
+        for (const f of readdirSync(dir)) {
+          const p = join(dir, f);
+          if (Date.now() - statSync(p).mtimeMs > ttl) rmSync(p, { force: true });
+        }
+        if (!readdirSync(dir).length) rmSync(dir, { recursive: true, force: true });
+      }
+    }
+    if (this.cfg.defaults.worktree_prune_after === 'off') return;
+    const idle = parseDuration(this.cfg.defaults.worktree_prune_after);
+    const bySlug = new Map(this.store.listSessions(100_000).map((s) => [sessionSlug(s.key), s]));
+    const isIdle = (slug: string) => {
+      const s = bySlug.get(slug);
+      return !s || Date.now() - s.last_active > idle;
+    };
+    for (const name of Object.keys(this.cfg.agents)) {
+      let removed: string[] = [];
+      try {
+        removed = this.agent(name).workspace?.prune?.(isIdle) ?? [];
+      } catch (err) {
+        this.log(`worktree prune for ${name} failed: ${(err as Error).message}`);
+      }
+      for (const b of removed) this.log(`pruned idle worktree ${b}`);
     }
   }
 
