@@ -74,7 +74,22 @@ Logs go to `~/Library/Logs/agents-bridge/bridge.log` (launchd can't write into `
 
 ### Parallel conversations on one repo
 
-With `worktree: true` on a `claude-code` agent, each conversation gets its own git worktree under `worktree_dir` on branch `bridge/<conversation>`, so two threads never edit the same checkout. Use `worktree_links` to link untracked things like `node_modules` from the main checkout. Merge the branches yourself.
+With `worktree: true` on a `claude-code` agent, each conversation gets its own git worktree under `worktree_dir` on branch `bridge/<conversation>`, so two threads never edit the same checkout. Use `worktree_links` to link untracked things like `node_modules` from the main checkout.
+
+Finish a conversation's branch from the thread itself (a message that is exactly the word):
+
+| say | does |
+|---|---|
+| `status` / `状态` | branch, commits not yet in the base branch, diffstat, uncommitted files |
+| `merge` / `合并` | shows what would land, then on `yes` squashes the branch into its base in your main checkout as one commit and removes the worktree |
+| `discard` / `丢弃` | removes the worktree and branch (asks first if that would lose commits or changes) |
+
+The base is whatever the main checkout had checked out when the conversation started; merge requires the main checkout to be on that branch with no uncommitted changes, and stops without changing anything on conflict.
+
+```bash
+node dist/cli.js worktrees                          # every conversation branch, with unmerged work
+node dist/cli.js worktrees prune --older-than 7d    # remove idle ones with nothing unmerged (--force for all)
+```
 
 ## Routing rules
 

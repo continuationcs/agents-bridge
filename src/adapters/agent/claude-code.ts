@@ -4,8 +4,17 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import type { AgentConfig } from '../../config/schema.ts';
-import type { AgentAdapter, AgentReply, AgentTurn } from './types.ts';
-import { ensureWorktree, expandHome } from './worktree.ts';
+import type { AgentAdapter, AgentReply, AgentTurn, Workspace } from './types.ts';
+import {
+  ensureWorktree,
+  expandHome,
+  mergeBlocker,
+  removeWorktree,
+  squashMerge,
+  worktreeStatus,
+  type WorktreeOpts,
+  type WorktreeStatus,
+} from './worktree.ts';
 
 type ClaudeCodeConfig = Extract<AgentConfig, { type: 'claude-code' }>;
 
@@ -20,10 +29,21 @@ export class ClaudeCodeAgent implements AgentAdapter {
   readonly name: string;
   private readonly cfg: ClaudeCodeConfig;
   private readonly running = new Set<ChildProcess>();
+  readonly workspace?: Workspace;
 
   constructor(name: string, cfg: ClaudeCodeConfig) {
     this.name = name;
     this.cfg = cfg;
+    if (cfg.worktree) this.workspace = new WorktreeWorkspace(this.worktreeOpts.bind(this));
+  }
+
+  private worktreeOpts(sessionKey: string): WorktreeOpts {
+    return {
+      baseCwd: expandHome(this.cfg.cwd ?? process.cwd()),
+      sessionKey,
+      dir: this.cfg.worktree_dir,
+      links: this.cfg.worktree_links,
+    };
   }
 
   async run(turn: AgentTurn): Promise<AgentReply> {
@@ -31,12 +51,7 @@ export class ClaudeCodeAgent implements AgentAdapter {
     let resume = turn.agentSessionId;
     let systemPrompt = BRIDGE_PROMPT;
     if (this.cfg.worktree) {
-      const wt = ensureWorktree({
-        baseCwd: cwd,
-        sessionKey: turn.envelope.sessionKey,
-        dir: this.cfg.worktree_dir,
-        links: this.cfg.worktree_links,
-      });
+      const wt = ensureWorktree(this.worktreeOpts(turn.envelope.sessionKey));
       cwd = wt.cwd;
       systemPrompt += `\n- You are working in your own git worktree (${wt.path}) on branch ${wt.branch}, separate from the user's main checkout. Stay on this branch and commit your changes here when a piece of work is done; the user merges the branch.`;
       // Claude sessions are stored per directory; one from another checkout can't be resumed here.
@@ -113,6 +128,68 @@ export class ClaudeCodeAgent implements AgentAdapter {
     for (const child of this.running) child.kill('SIGTERM');
     this.running.clear();
   }
+}
+
+/** status / merge / discard for a conversation's `bridge/…` branch. */
+class WorktreeWorkspace implements Workspace {
+  private readonly opts: (sessionKey: string) => WorktreeOpts;
+  constructor(opts: (sessionKey: string) => WorktreeOpts) {
+    this.opts = opts;
+  }
+
+  status(key: string) {
+    const st = worktreeStatus(this.opts(key));
+    return st && describe(st);
+  }
+
+  previewMerge(key: string) {
+    const o = this.opts(key);
+    const st = worktreeStatus(o);
+    if (!st) return { ok: false as const, reason: 'this conversation has no branch yet' };
+    const blocker = mergeBlocker(o, st);
+    if (blocker) return { ok: false as const, reason: `can't merge: ${blocker}` };
+    return { ok: true as const, summary: `Squash ${st.commits.length} commit(s) from \`${st.branch}\` into \`${st.base}\` as one commit:\n${commitList(st)}\n${fence(st.diffstat)}` };
+  }
+
+  merge(key: string) {
+    const { commit, message } = squashMerge(this.opts(key));
+    return `✅ Merged into one commit \`${commit}\` — ${message.split('\n')[0]}. The branch and its worktree are removed; your next message starts fresh from the updated base.`;
+  }
+
+  previewDiscard(key: string) {
+    const st = worktreeStatus(this.opts(key));
+    if (!st) return undefined;
+    const lost = [
+      st.commits.length ? `${st.commits.length} unmerged commit(s):\n${commitList(st)}` : '',
+      st.dirty.length ? `${st.dirty.length} uncommitted file(s)` : '',
+    ].filter(Boolean);
+    return lost.join('\n');
+  }
+
+  discard(key: string) {
+    const st = worktreeStatus(this.opts(key));
+    removeWorktree(this.opts(key));
+    return `🗑 Discarded ${st ? `\`${st.branch}\`` : 'the branch'}. Your next message starts fresh.`;
+  }
+}
+
+function describe(st: WorktreeStatus): string {
+  const lines = [`🌿 \`${st.branch}\` (from \`${st.base}\`)`];
+  lines.push(st.commits.length ? `${st.commits.length} commit(s) not in ${st.base}:\n${commitList(st)}` : `No commits beyond ${st.base} yet.`);
+  if (st.diffstat) lines.push(fence(st.diffstat));
+  if (st.dirty.length) lines.push(`Uncommitted: ${st.dirty.map((d) => d.slice(3)).join(', ')}`);
+  lines.push('Reply `merge` to squash it into the base branch, or `discard` to throw it away.');
+  return lines.join('\n');
+}
+
+function commitList(st: WorktreeStatus) {
+  const shown = st.commits.slice(0, 10).map((c) => `• ${c}`);
+  if (st.commits.length > 10) shown.push(`• … and ${st.commits.length - 10} more`);
+  return shown.join('\n');
+}
+
+function fence(s: string) {
+  return s ? '```\n' + s + '\n```' : '';
 }
 
 function describeToolUse(name: string, input: any): string {

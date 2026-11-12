@@ -1,7 +1,7 @@
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 import type { BridgeConfig, TrustLevel } from '../config/schema.ts';
 import { createAgent } from '../adapters/agent/index.ts';
-import type { AgentAdapter, AgentReply } from '../adapters/agent/types.ts';
+import type { AgentAdapter, AgentReply, Workspace } from '../adapters/agent/types.ts';
 import type { ImAdapter } from '../adapters/im/types.ts';
 import { McpHub, type HubBackend, type SessionGrant, type ToolResult } from '../mcp/hub.ts';
 import { ToolHub } from '../mcp/tools.ts';
@@ -58,7 +58,14 @@ export interface BridgeOptions {
   log?: (line: string) => void;
 }
 
-const APPROVE = /^(approve|approved|yes|y|ok|lgtm|批准|同意|可以)$/i;
+const APPROVE = /^(approve|approved|yes|y|ok|lgtm|批准|同意|可以|确认|好|好的|是)$/i;
+
+/** A message that is exactly one of these words is a workspace command, not a prompt. */
+const COMMANDS: Record<string, 'status' | 'merge' | 'discard'> = {
+  status: 'status', 状态: 'status',
+  merge: 'merge', 合并: 'merge',
+  discard: 'discard', 丢弃: 'discard', 放弃: 'discard',
+};
 const DENY = /^(deny|denied|no|n|reject|拒绝|不行)$/i;
 
 export class Bridge implements HubBackend {
@@ -162,6 +169,15 @@ export class Bridge implements HubBackend {
       return;
     }
 
+    const command = COMMANDS[match.text.trim().toLowerCase()];
+    const workspace = command ? this.agent(match.agent).workspace : undefined;
+    if (command && workspace) {
+      const who = person?.id ?? `${msg.platform}:${msg.userId}`;
+      this.store.trace(key, 'command', who, { command });
+      this.schedule(key, () => this.runCommand(command, workspace, key, thread, who));
+      return;
+    }
+
     const trust: TrustLevel = person?.trust ?? 'external';
     const envelope = newEnvelope({
       sender: {
@@ -183,6 +199,40 @@ export class Bridge implements HubBackend {
     this.store.enqueue(envelope.id, key, job);
     this.store.trace(key, 'inbound', envelope.initiator, { route: match.index, agent: match.agent, text: match.text });
     this.schedule(key, () => this.runJob(job));
+  }
+
+  /** status / merge / discard on the conversation's branch. Runs in the thread's queue, so never mid-turn. */
+  private async runCommand(command: 'status' | 'merge' | 'discard', ws: Workspace, key: string, thread: ThreadRef, who: string) {
+    const confirm = async (prompt: string) => {
+      await this.send(thread, `${prompt}\nReply \`yes\` to go ahead; anything else cancels.`);
+      const answer = await this.waitFor(key, [who], 10 * 60e3, () => true);
+      if (answer && APPROVE.test(answer.text)) return true;
+      await this.send(thread, answer ? 'Cancelled.' : 'No answer in 10 minutes — cancelled.');
+      return false;
+    };
+    try {
+      if (command === 'status') {
+        await this.send(thread, ws.status(key) ?? 'This conversation has no branch yet — it gets one with the first change.');
+      } else if (command === 'merge') {
+        const preview = ws.previewMerge(key);
+        if (!preview.ok) return void (await this.send(thread, `⚠️ ${preview.reason}`));
+        if (!(await confirm(preview.summary))) return;
+        const result = ws.merge(key);
+        this.store.deleteSession(key);
+        this.store.trace(key, 'merged', who, { result });
+        await this.send(thread, result);
+      } else {
+        const lost = ws.previewDiscard(key);
+        if (lost === undefined) return void (await this.send(thread, 'This conversation has no branch to discard.'));
+        if (lost && !(await confirm(`🗑 This throws away ${lost}`))) return;
+        const result = ws.discard(key);
+        this.store.deleteSession(key);
+        this.store.trace(key, 'discarded', who, {});
+        await this.send(thread, result);
+      }
+    } catch (err) {
+      await this.send(thread, `⚠️ ${command} failed: ${(err as Error).message}`);
+    }
   }
 
   private schedule(key: string, fn: () => Promise<void>) {

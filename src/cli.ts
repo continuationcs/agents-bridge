@@ -18,6 +18,8 @@ import { ToolHub } from './mcp/tools.ts';
 import { resolveSecret, setSecret } from './secrets.ts';
 import { TEMPLATE } from './template.ts';
 import { slackManifest } from './slack-manifest.ts';
+import { expandHome, listWorktrees, removeAt, sessionSlug, statusAt } from './adapters/agent/worktree.ts';
+import { parseDuration } from './core/address.ts';
 import { installService, restartService, serviceStatus, uninstallService } from './service.ts';
 
 const HELP = `agents-bridge — connect agents to IM, to each other, and to tools
@@ -34,6 +36,8 @@ Usage: agents-bridge <command> [options]
   secret set <name>        store a secret in the OS keychain (value read from stdin)
   service install|uninstall|restart|status
                            run the bridge in the background via launchd (macOS)
+  worktrees                list conversation branches (claude-code agents with worktree: true)
+  worktrees prune          remove idle worktrees with nothing unmerged  [--older-than 7d] [--force]
   status                   show the running bridge
   sessions                 list recent sessions
   trace [--session <key>]  show the audit trail
@@ -55,6 +59,7 @@ async function main() {
       session: { type: 'string' },
       limit: { type: 'string', short: 'n', default: '50' },
       force: { type: 'boolean', default: false },
+      'older-than': { type: 'string', default: '7d' },
       help: { type: 'boolean', short: 'h' },
     },
   });
@@ -120,6 +125,43 @@ async function main() {
       } else if (sub === 'status') {
         console.log(JSON.stringify(serviceStatus(), null, 2));
       } else fail('usage: agents-bridge service install|uninstall|restart|status');
+      return;
+    }
+    case 'worktrees': {
+      const cfg = load(configPath);
+      const store = openStore(cfg, configPath);
+      const sessions = new Map(store.listSessions(10_000).map((s) => [sessionSlug(s.key), s]));
+      const prune = sub === 'prune';
+      if (sub && !prune) fail('usage: agents-bridge worktrees [prune [--older-than 7d] [--force]]');
+      const cutoff = Date.now() - parseDuration(values['older-than']!);
+      let count = 0;
+      for (const [name, agent] of Object.entries(cfg.agents)) {
+        if (agent.type !== 'claude-code' || !agent.worktree) continue;
+        for (const wt of listWorktrees(expandHome(agent.cwd ?? process.cwd()))) {
+          const st = statusAt(wt.root, wt.path, wt.branch, agent.worktree_links);
+          const session = sessions.get(wt.branch.replace(/^bridge\//, ''));
+          const last = session?.last_active;
+          const unmerged = (st?.commits.length ?? 0) + (st?.dirty.length ?? 0);
+          if (prune) {
+            if (last && last > cutoff) continue;
+            if (unmerged && !values.force) {
+              console.log(`kept    ${wt.branch}  (${st?.commits.length ?? 0} unmerged commits, ${st?.dirty.length ?? 0} uncommitted files; --force to remove)`);
+              continue;
+            }
+            removeAt(wt.root, wt.path, wt.branch);
+            if (session) store.deleteSession(session.key);
+            console.log(`removed ${wt.branch}`);
+            count++;
+            continue;
+          }
+          count++;
+          console.log(
+            `${wt.branch}  [${name}]  base ${st?.base ?? '?'}  ${st?.commits.length ?? 0} commits  ${st?.dirty.length ?? 0} uncommitted  ` +
+              `last active ${last ? new Date(last).toISOString() : 'unknown'}\n  ${wt.path}${session ? `\n  session ${session.key}` : ''}`,
+          );
+        }
+      }
+      if (!count) console.log(prune ? 'nothing to prune' : 'no conversation worktrees');
       return;
     }
     case 'slack': {
