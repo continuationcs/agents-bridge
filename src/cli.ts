@@ -4,6 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { resolve, join, dirname, basename } from 'node:path';
 import { parseArgs } from 'node:util';
 import { createInterface } from 'node:readline';
+import { homedir } from 'node:os';
 import { ConfigError, loadConfigFile } from './config/load.ts';
 import type { BridgeConfig } from './config/schema.ts';
 import { Bridge } from './core/bridge.ts';
@@ -104,8 +105,9 @@ async function main() {
       return;
     }
     case 'service': {
-      const cfg = load(configPath);
-      const logFile = join(resolve(configPath, '..', cfg.server.data_dir), 'bridge.log');
+      load(configPath); // refuse to install a service with a broken config
+      // launchd opens the log itself, and it can't write into TCC-protected folders like ~/Documents.
+      const logFile = join(homedir(), 'Library', 'Logs', 'agents-bridge', 'bridge.log');
       if (sub === 'install') {
         const plist = installService({ configPath, logFile });
         console.log(`installed ${plist}\nlogs: ${logFile}`);

@@ -70,7 +70,7 @@ node dist/cli.js service status
 node dist/cli.js service uninstall
 ```
 
-Logs go to `<data_dir>/bridge.log`. A turn cut off by a restart resumes in the same agent session (at most twice), and anything queued while the bridge was down runs when it comes back, within `offline_queue_ttl`.
+Logs go to `~/Library/Logs/agents-bridge/bridge.log` (launchd can't write into `~/Documents`). A turn cut off by a restart resumes in the same agent session (at most twice), and anything queued while the bridge was down runs when it comes back, within `offline_queue_ttl`.
 
 ### Parallel conversations on one repo
 
