@@ -31,6 +31,7 @@ export class WebhookAgent implements AgentAdapter {
         type: 'turn',
         text: turn.text,
         session_id: turn.agentSessionId ?? null,
+        budget_usd: turn.budgetUsd ?? null,
         envelope: turn.envelope,
         mcp: { url: turn.mcp.url },
       }),
