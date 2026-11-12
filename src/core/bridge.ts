@@ -34,7 +34,12 @@ interface Job {
   text: string;
   envelope: Envelope;
   thread: ThreadRef;
+  /** How many times this turn was cut off by a bridge restart. */
+  interrupted?: number;
 }
+
+/** A turn interrupted this many times is given up instead of resumed again. */
+const MAX_RESUMES = 2;
 
 interface Waiter {
   allowed: Set<string>;
@@ -192,13 +197,28 @@ export class Bridge implements HubBackend {
     const ttl = parseDuration(this.cfg.defaults.offline_queue_ttl);
     for (const row of this.store.takePending(ttl)) {
       const job = JSON.parse(row.payload) as Job;
-      this.log(`resuming queued message ${row.id} for ${job.agent}`);
-      this.schedule(job.sessionKey, () => this.runJob(job));
+      if (row.status === 'pending') {
+        this.log(`running queued message ${row.id} for ${job.agent}`);
+        this.schedule(job.sessionKey, () => this.runJob(job));
+        continue;
+      }
+      job.interrupted = (job.interrupted ?? 0) + 1;
+      this.log(`resuming interrupted turn ${row.id} for ${job.agent} (attempt ${job.interrupted})`);
+      this.schedule(job.sessionKey, async () => {
+        if (job.interrupted! > MAX_RESUMES) {
+          this.store.finish(job.envelope.id, 'failed');
+          await this.send(job.thread, `⚠️ ${job.agent}'s turn was interrupted ${job.interrupted} times by bridge restarts, so I stopped retrying. Send the request again to restart it.`);
+          return;
+        }
+        await this.send(job.thread, `🔁 The bridge restarted in the middle of ${job.agent}'s turn — resuming.`);
+        await this.runJob(job);
+      });
     }
   }
 
   private async runJob(job: Job) {
     const { sessionKey, agent, thread } = job;
+    this.store.markRunning(job.envelope.id, job);
     let session = this.store.getSession(sessionKey);
     if (session && session.agent !== agent) {
       this.store.updateSession(sessionKey, { agent_session_id: null });
@@ -233,7 +253,12 @@ export class Bridge implements HubBackend {
 
     const ctx: TurnCtx = { sessionKey, rootKey: sessionKey, agent, envelope: job.envelope, thread };
     try {
-      const reply = await this.invoke(ctx, job.text, session.agent_session_id ?? undefined, onProgress);
+      // Resuming a cut-off turn: the agent session already holds the request and any partial work.
+      const text =
+        job.interrupted && session.agent_session_id
+          ? `[agents-bridge] Your previous turn was interrupted because the bridge restarted. Check what you had already done, then finish the original request:\n\n${job.text}`
+          : job.text;
+      const reply = await this.invoke(ctx, text, session.agent_session_id ?? undefined, onProgress);
       await this.post(thread, reply.text || '(no reply)', placeholder);
       this.store.finish(job.envelope.id, 'done');
     } catch (err) {
@@ -256,6 +281,8 @@ export class Bridge implements HubBackend {
         agentSessionId,
         mcp: { url: grant.url, token: grant.token },
         onProgress,
+        onSessionId: (id) => this.store.updateSession(ctx.sessionKey, { agent_session_id: id }),
+        onNotice: (note) => void this.send(ctx.thread, note).catch(() => {}),
       });
       this.store.updateSession(ctx.sessionKey, { agent_session_id: reply.agentSessionId ?? null });
       if (reply.costUsd) this.store.updateSession(ctx.rootKey, { addSpentUsd: reply.costUsd });

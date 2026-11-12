@@ -62,6 +62,20 @@ node dist/cli.js up
 
 `bridge.yaml` is hot-reloaded. Changing IM credentials needs a restart.
 
+### Run it in the background (macOS)
+
+```bash
+node dist/cli.js service install   # LaunchAgent: starts at login, restarted if it exits
+node dist/cli.js service status
+node dist/cli.js service uninstall
+```
+
+Logs go to `<data_dir>/bridge.log`. A turn cut off by a restart resumes in the same agent session (at most twice), and anything queued while the bridge was down runs when it comes back, within `offline_queue_ttl`.
+
+### Parallel conversations on one repo
+
+With `worktree: true` on a `claude-code` agent, each conversation gets its own git worktree under `worktree_dir` on branch `bridge/<conversation>`, so two threads never edit the same checkout. Use `worktree_links` to link untracked things like `node_modules` from the main checkout. Merge the branches yourself.
+
 ## Routing rules
 
 - An IM route goes to exactly one agent. A route to an agent that runs on this machine (`claude-code`, `stdio`) must name `when.sender`, or say `sender: anyone` explicitly.

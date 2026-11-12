@@ -10,6 +10,10 @@ export interface AgentTurn {
   mcp: { url: string; token: string };
   /** Short progress lines ("Reading src/…"). */
   onProgress?: (line: string) => void;
+  /** The agent's session id, as soon as it is known (lets a crashed turn be resumed). */
+  onSessionId?: (id: string) => void;
+  /** A one-off note for the conversation (e.g. "working on branch X"). */
+  onNotice?: (text: string) => void;
   signal?: AbortSignal;
 }
 

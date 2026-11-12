@@ -17,6 +17,7 @@ export interface SessionRow {
 
 export interface QueueRow {
   id: string;
+  status: 'pending' | 'running';
   session_key: string;
   payload: string;
   created_at: number;
@@ -99,16 +100,28 @@ export class Store {
       .run(id, sessionKey, JSON.stringify(payload), Date.now());
   }
 
+  /** A turn has started; `payload` is saved so a crash can resume it. */
+  markRunning(id: string, payload: unknown) {
+    this.db.prepare(`UPDATE queue SET status = 'running', payload = ? WHERE id = ?`).run(JSON.stringify(payload), id);
+  }
+
   finish(id: string, status: 'done' | 'failed' | 'expired') {
     this.db.prepare('UPDATE queue SET status = ? WHERE id = ?').run(status, id);
   }
 
-  /** Pending work left over from a previous run; anything older than `ttlMs` is expired instead. */
+  /**
+   * Work left over from a previous run: `pending` never started, `running` was cut off mid-turn.
+   * Anything older than `ttlMs` is expired instead.
+   */
   takePending(ttlMs: number): QueueRow[] {
     const cutoff = Date.now() - ttlMs;
-    this.db.prepare(`UPDATE queue SET status = 'expired' WHERE status = 'pending' AND created_at < ?`).run(cutoff);
+    this.db
+      .prepare(`UPDATE queue SET status = 'expired' WHERE status IN ('pending', 'running') AND created_at < ?`)
+      .run(cutoff);
     return this.db
-      .prepare(`SELECT id, session_key, payload, created_at FROM queue WHERE status = 'pending' ORDER BY created_at`)
+      .prepare(
+        `SELECT id, status, session_key, payload, created_at FROM queue WHERE status IN ('pending', 'running') ORDER BY created_at`,
+      )
       .all() as unknown as QueueRow[];
   }
 

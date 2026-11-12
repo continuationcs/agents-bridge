@@ -17,6 +17,7 @@ import { ToolHub } from './mcp/tools.ts';
 import { resolveSecret, setSecret } from './secrets.ts';
 import { TEMPLATE } from './template.ts';
 import { slackManifest } from './slack-manifest.ts';
+import { installService, restartService, serviceStatus, uninstallService } from './service.ts';
 
 const HELP = `agents-bridge — connect agents to IM, to each other, and to tools
 
@@ -30,6 +31,8 @@ Usage: agents-bridge <command> [options]
                              --from slack:#dev --sender alice [--text "..."] [--mention] [--dm]
   slack manifest [name]    print a Slack app manifest (Socket Mode, DMs, channels)
   secret set <name>        store a secret in the OS keychain (value read from stdin)
+  service install|uninstall|restart|status
+                           run the bridge in the background via launchd (macOS)
   status                   show the running bridge
   sessions                 list recent sessions
   trace [--session <key>]  show the audit trail
@@ -98,6 +101,23 @@ async function main() {
         { personId: sender && cfg.people[sender] ? sender : undefined },
       );
       for (const line of trace) console.log(line);
+      return;
+    }
+    case 'service': {
+      const cfg = load(configPath);
+      const logFile = join(resolve(configPath, '..', cfg.server.data_dir), 'bridge.log');
+      if (sub === 'install') {
+        const plist = installService({ configPath, logFile });
+        console.log(`installed ${plist}\nlogs: ${logFile}`);
+      } else if (sub === 'uninstall') {
+        uninstallService();
+        console.log('service removed');
+      } else if (sub === 'restart') {
+        restartService();
+        console.log('restarted');
+      } else if (sub === 'status') {
+        console.log(JSON.stringify(serviceStatus(), null, 2));
+      } else fail('usage: agents-bridge service install|uninstall|restart|status');
       return;
     }
     case 'slack': {

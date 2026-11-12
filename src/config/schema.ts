@@ -38,6 +38,11 @@ const ClaudeCodeAgent = z
     permission_mode: z.enum(['default', 'acceptEdits', 'plan', 'bypassPermissions']).default('default'),
     allowed_tools: z.array(z.string()).default([]),
     model: z.string().optional(),
+    /** Give every conversation its own git worktree + branch so parallel threads never touch the same checkout. */
+    worktree: z.boolean().default(false),
+    worktree_dir: z.string().default('~/.agents-bridge/worktrees'),
+    /** Untracked paths linked into each worktree from the main checkout (e.g. node_modules, .env). */
+    worktree_links: z.array(z.string()).default([]),
     description: z.string().optional(),
   })
   .strict();

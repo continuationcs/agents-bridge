@@ -33,7 +33,12 @@ export function setSecret(name: string, value: string) {
   if (process.platform !== 'darwin') {
     throw new Error(`no keychain support on ${process.platform} yet — export ${envName(name)} instead`);
   }
-  execFileSync('security', ['add-generic-password', '-U', '-s', SERVICE, '-a', name, '-w', value], { stdio: 'ignore' });
+  // `security -i` reads the command from stdin, so the value never appears in argv (visible to `ps`).
+  const q = (v: string) => `"${v.replace(/(["\\])/g, '\\$1')}"`;
+  execFileSync('security', ['-i'], {
+    input: `add-generic-password -U -s ${q(SERVICE)} -a ${q(name)} -w ${q(value)}\n`,
+    stdio: ['pipe', 'ignore', 'pipe'],
+  });
 }
 
 function envName(name: string) {

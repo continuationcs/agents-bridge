@@ -1,10 +1,11 @@
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir, homedir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import type { AgentConfig } from '../../config/schema.ts';
 import type { AgentAdapter, AgentReply, AgentTurn } from './types.ts';
+import { ensureWorktree, expandHome } from './worktree.ts';
 
 type ClaudeCodeConfig = Extract<AgentConfig, { type: 'claude-code' }>;
 
@@ -17,6 +18,7 @@ const BRIDGE_PROMPT = `You are being reached through agents-bridge. Messages com
 export class ClaudeCodeAgent implements AgentAdapter {
   readonly name: string;
   private readonly cfg: ClaudeCodeConfig;
+  private readonly running = new Set<ChildProcess>();
 
   constructor(name: string, cfg: ClaudeCodeConfig) {
     this.name = name;
@@ -24,6 +26,22 @@ export class ClaudeCodeAgent implements AgentAdapter {
   }
 
   async run(turn: AgentTurn): Promise<AgentReply> {
+    let cwd = expandHome(this.cfg.cwd ?? process.cwd());
+    let resume = turn.agentSessionId;
+    let systemPrompt = BRIDGE_PROMPT;
+    if (this.cfg.worktree) {
+      const wt = ensureWorktree({
+        baseCwd: cwd,
+        sessionKey: turn.envelope.sessionKey,
+        dir: this.cfg.worktree_dir,
+        links: this.cfg.worktree_links,
+      });
+      cwd = wt.cwd;
+      systemPrompt += `\n- You are working in your own git worktree (${wt.path}) on branch ${wt.branch}, separate from the user's main checkout. Stay on this branch and commit your changes here when a piece of work is done; the user merges the branch.`;
+      // Claude sessions are stored per directory; one from another checkout can't be resumed here.
+      if (wt.created) resume = undefined;
+      if (wt.created) turn.onNotice?.(`🌿 ${this.name} works on its own branch \`${wt.branch}\` for this conversation (${wt.path}).`);
+    }
     const dir = mkdtempSync(join(tmpdir(), 'agents-bridge-'));
     const mcpFile = join(dir, 'mcp.json');
     writeFileSync(mcpFile, JSON.stringify({ mcpServers: { bridge: { type: 'http', url: turn.mcp.url } } }), {
@@ -34,20 +52,22 @@ export class ClaudeCodeAgent implements AgentAdapter {
       '--output-format', 'stream-json',
       '--verbose',
       '--mcp-config', mcpFile,
-      '--append-system-prompt', BRIDGE_PROMPT,
+      '--append-system-prompt', systemPrompt,
       '--permission-mode', this.cfg.permission_mode,
       '--allowedTools', ['mcp__bridge', ...this.cfg.allowed_tools].join(','),
     ];
-    if (turn.agentSessionId) args.push('--resume', turn.agentSessionId);
+    if (resume) args.push('--resume', resume);
     if (this.cfg.model) args.push('--model', this.cfg.model);
 
     try {
       return await new Promise<AgentReply>((resolve, reject) => {
         const child = spawn(this.cfg.command, args, {
-          cwd: expandHome(this.cfg.cwd ?? process.cwd()),
+          cwd,
           stdio: ['pipe', 'pipe', 'pipe'],
           signal: turn.signal,
         });
+        this.running.add(child);
+        child.on('close', () => this.running.delete(child));
         let result: AgentReply | undefined;
         let sessionId: string | undefined;
         let stderr = '';
@@ -59,7 +79,10 @@ export class ClaudeCodeAgent implements AgentAdapter {
           } catch {
             return;
           }
-          if (ev.session_id) sessionId = ev.session_id;
+          if (ev.session_id && ev.session_id !== sessionId) {
+            sessionId = ev.session_id;
+            turn.onSessionId?.(ev.session_id);
+          }
           if (ev.type === 'assistant') {
             for (const block of ev.message?.content ?? []) {
               if (block.type === 'tool_use') turn.onProgress?.(describeToolUse(block.name, block.input));
@@ -83,14 +106,16 @@ export class ClaudeCodeAgent implements AgentAdapter {
       rmSync(dir, { recursive: true, force: true });
     }
   }
+
+  /** Bridge shutdown: end running turns so they can't keep editing while a resumed turn starts. */
+  async stop() {
+    for (const child of this.running) child.kill('SIGTERM');
+    this.running.clear();
+  }
 }
 
 function describeToolUse(name: string, input: any): string {
   const target = input?.file_path ?? input?.path ?? input?.pattern ?? input?.command ?? input?.url;
   const short = typeof target === 'string' ? ` ${target.length > 60 ? target.slice(0, 57) + '…' : target}` : '';
   return `${name.replace(/^mcp__bridge__/, '')}${short}`;
-}
-
-function expandHome(p: string) {
-  return p.startsWith('~/') ? join(homedir(), p.slice(2)) : p;
 }
