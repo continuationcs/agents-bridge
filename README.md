@@ -85,6 +85,7 @@ Finish a conversation's branch from the thread itself (a message that is exactly
 | `status` / `状态` | branch, commits not yet in the base branch, diffstat, uncommitted files |
 | `merge` / `合并` | shows what would land, then on `yes` squashes the branch into its base in your main checkout as one commit and removes the worktree |
 | `discard` / `丢弃` | removes the worktree and branch (asks first if that would lose commits or changes) |
+| `pr` / `开pr` | pushes the branch to `origin` and opens a pull request into the base (or reports the open one); needs `git_token` on the agent |
 
 The base is whatever the main checkout had checked out when the conversation started; merge requires the main checkout to be on that branch with no uncommitted changes, and stops without changing anything on conflict.
 

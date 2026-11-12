@@ -35,6 +35,9 @@ export interface Workspace {
   /** What discarding would throw away ('' when there is nothing to lose). */
   previewDiscard(sessionKey: string): string | undefined;
   discard(sessionKey: string): string;
+  /** Push the branch and open a pull request; absent when no git token is configured. */
+  previewPr?(sessionKey: string): { ok: true; summary: string } | { ok: false; reason: string };
+  pr?(sessionKey: string): string;
 }
 
 export interface AgentAdapter {

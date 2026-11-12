@@ -5,10 +5,13 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import type { AgentConfig } from '../../config/schema.ts';
 import type { AgentAdapter, AgentReply, AgentTurn, Workspace } from './types.ts';
+import { resolveSecret } from '../../secrets.ts';
 import {
   ensureWorktree,
   expandHome,
   mergeBlocker,
+  prBlocker,
+  pushPullRequest,
   removeWorktree,
   squashMerge,
   worktreeStatus,
@@ -34,7 +37,7 @@ export class ClaudeCodeAgent implements AgentAdapter {
   constructor(name: string, cfg: ClaudeCodeConfig) {
     this.name = name;
     this.cfg = cfg;
-    if (cfg.worktree) this.workspace = new WorktreeWorkspace(this.worktreeOpts.bind(this));
+    if (cfg.worktree) this.workspace = new WorktreeWorkspace(this.worktreeOpts.bind(this), cfg.git_token);
   }
 
   private worktreeOpts(sessionKey: string): WorktreeOpts {
@@ -140,8 +143,25 @@ export class ClaudeCodeAgent implements AgentAdapter {
 /** status / merge / discard for a conversation's `bridge/…` branch. */
 class WorktreeWorkspace implements Workspace {
   private readonly opts: (sessionKey: string) => WorktreeOpts;
-  constructor(opts: (sessionKey: string) => WorktreeOpts) {
+  readonly previewPr?: Workspace['previewPr'];
+  readonly pr?: Workspace['pr'];
+
+  constructor(opts: (sessionKey: string) => WorktreeOpts, gitToken?: string) {
     this.opts = opts;
+    if (gitToken) {
+      this.previewPr = (key) => {
+        const o = this.opts(key);
+        const st = worktreeStatus(o);
+        if (!st) return { ok: false, reason: 'this conversation has no branch yet' };
+        const blocker = prBlocker(o, st);
+        if (blocker) return { ok: false, reason: `can't open a PR: ${blocker}` };
+        return { ok: true, summary: `Push \`${st.branch}\` (${st.commits.length} commit(s)) to origin and open a pull request into \`${st.base}\`:\n${commitList(st)}` };
+      };
+      this.pr = (key) => {
+        const { url, created } = pushPullRequest(this.opts(key), resolveSecret(gitToken));
+        return created ? `🔀 Opened ${url}` : `🔀 Pushed new commits to the open PR ${url}`;
+      };
+    }
   }
 
   status(key: string) {
@@ -185,7 +205,7 @@ function describe(st: WorktreeStatus): string {
   lines.push(st.commits.length ? `${st.commits.length} commit(s) not in ${st.base}:\n${commitList(st)}` : `No commits beyond ${st.base} yet.`);
   if (st.diffstat) lines.push(fence(st.diffstat));
   if (st.dirty.length) lines.push(`Uncommitted: ${st.dirty.map((d) => d.slice(3)).join(', ')}`);
-  lines.push('Reply `merge` to squash it into the base branch, or `discard` to throw it away.');
+  lines.push('Reply `merge` to squash it into the base branch, `pr` to open a pull request, or `discard` to throw it away.');
   return lines.join('\n');
 }
 

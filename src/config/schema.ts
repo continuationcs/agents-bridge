@@ -43,6 +43,8 @@ const ClaudeCodeAgent = z
     worktree_dir: z.string().default('~/.agents-bridge/worktrees'),
     /** Untracked paths linked into each worktree from the main checkout (e.g. node_modules, .env). */
     worktree_links: z.array(z.string()).default([]),
+    /** Token used to push conversation branches and open PRs (the `pr` command). */
+    git_token: SecretRef.optional(),
     description: z.string().optional(),
   })
   .strict();
