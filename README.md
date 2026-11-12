@@ -130,5 +130,3 @@ src/
 - Web UI (`status` serves JSON at `/api/status` for now)
 - Config-editing CLI commands (`connect`, `add`, `link`, `allow`); edit `bridge.yaml` directly
 - Strict policy on `tainted` envelopes (the flag is recorded but not enforced)
-
-Merged from Slack
