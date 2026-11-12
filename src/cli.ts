@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { existsSync, watch, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { resolve, join } from 'node:path';
+import { resolve, join, dirname, basename } from 'node:path';
 import { parseArgs } from 'node:util';
 import { createInterface } from 'node:readline';
 import { ConfigError, loadConfigFile } from './config/load.ts';
@@ -150,7 +150,9 @@ async function run(configPath: string, ims: (cfg: BridgeConfig) => ImAdapter[], 
   log(`agents-bridge up — MCP hub ${mcpUrl}, ${Object.keys(cfg.agents).length} agents, ${cfg.routes.length} routes`);
 
   let timer: NodeJS.Timeout | undefined;
-  watch(configPath, () => {
+  // Watch the directory: editors that replace the file would orphan a file watcher.
+  watch(dirname(configPath), (_event, file) => {
+    if (file && file !== basename(configPath)) return;
     clearTimeout(timer);
     timer = setTimeout(() => {
       try {
