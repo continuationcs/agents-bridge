@@ -521,16 +521,28 @@ export class Bridge implements HubBackend {
   }
 }
 
-function split(text: string, max: number): string[] {
+/** Split long replies at line breaks; a code fence cut in two is closed and reopened. */
+export function split(text: string, max: number): string[] {
   if (text.length <= max) return [text];
   const out: string[] = [];
   let rest = text;
-  while (rest.length > max) {
-    let cut = rest.lastIndexOf('\n', max);
-    if (cut < max * 0.5) cut = max;
-    out.push(rest.slice(0, cut));
+  let reopen = '';
+  while (rest.length) {
+    const room = max - reopen.length - 4;
+    let cut = rest.length;
+    if (rest.length > room) {
+      cut = rest.lastIndexOf('\n', room);
+      if (cut < room * 0.5) cut = room;
+    }
+    let chunk = reopen + rest.slice(0, cut);
     rest = rest.slice(cut).replace(/^\n/, '');
+    const fences = chunk.split('\n').filter((l) => /^\s*(```|~~~)/.test(l));
+    const open = fences.length % 2 === 1;
+    if (open && rest.length) {
+      chunk += '\n```';
+      reopen = '```\n';
+    } else reopen = '';
+    out.push(chunk);
   }
-  if (rest) out.push(rest);
   return out;
 }

@@ -1,6 +1,7 @@
 import { SocketModeClient } from '@slack/socket-mode';
 import { WebClient } from '@slack/web-api';
 import type { InboundMessage } from '../../core/router.ts';
+import { toSlackMrkdwn } from './slack-format.ts';
 import type { ImAdapter, OutboundMessage } from './types.ts';
 
 /**
@@ -52,7 +53,7 @@ export class SlackAdapter implements ImAdapter {
   async send(msg: OutboundMessage): Promise<string> {
     const res = await this.web.chat.postMessage({
       channel: msg.channelId,
-      text: msg.text,
+      text: toSlackMrkdwn(msg.text),
       thread_ts: msg.isDM ? undefined : msg.threadId,
       unfurl_links: false,
     });
@@ -60,7 +61,7 @@ export class SlackAdapter implements ImAdapter {
   }
 
   async edit(channelId: string, messageId: string, text: string) {
-    await this.web.chat.update({ channel: channelId, ts: messageId, text });
+    await this.web.chat.update({ channel: channelId, ts: messageId, text: toSlackMrkdwn(text) });
   }
 
   private async channelName(id: string): Promise<string> {
