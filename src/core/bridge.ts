@@ -613,6 +613,7 @@ export class Bridge implements HubBackend {
     });
 
     const outcome = opts.outcome(result);
+    this.store.trace(opts.key, 'choice', result?.by ?? 'timeout', { value: result?.value ?? null, outcome, buttons: !!messageId });
     if (messageId && im?.resolveChoice) {
       await im.resolveChoice(opts.thread.channelId, messageId, opts.text, outcome).catch(() => this.send(opts.thread, outcome));
     } else {
