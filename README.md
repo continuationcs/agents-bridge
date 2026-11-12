@@ -60,6 +60,8 @@ node dist/cli.js routes explain --from slack:#dev --sender alice --mention
 node dist/cli.js up
 ```
 
+Approvals and merge/discard confirmations are Slack buttons (typed `approve` / `deny` / `yes` also work). A `budget_usd` policy is a per-conversation cap: each turn is started with only what is left (Claude Code gets it as `--max-budget-usd`).
+
 `bridge.yaml` is hot-reloaded. Changing IM credentials needs a restart.
 
 ### Run it in the background (macOS)
@@ -101,7 +103,7 @@ node dist/cli.js worktrees prune --older-than 7d    # remove idle ones with noth
 
 ## Agent protocols
 
-**Webhook**: `POST <url>` with `{"type":"turn","text","session_id","envelope","mcp":{"url"}}`. Respond with `{"text","session_id"?,"cost_usd"?}`.
+**Webhook**: `POST <url>` with `{"type":"turn","text","session_id","budget_usd","envelope","mcp":{"url"}}` (`budget_usd` is what is left of the conversation budget, or null). Respond with `{"text","session_id"?,"cost_usd"?}`.
 
 **stdio**: a long-running process. The bridge writes `{"type":"turn","id",…}` lines to it, and it writes back `{"type":"progress","id","text"}`, `{"type":"reply","id","text","session_id"?,"cost_usd"?}` or `{"type":"error","id","message"}`. See [examples/echo-agent.mjs](examples/echo-agent.mjs).
 
@@ -125,7 +127,7 @@ src/
 
 ## Not in v0.1 yet
 
-- Discord and Feishu adapters, and Slack approval buttons (approvals are a text reply: `approve` / `deny`)
+- Discord and Feishu adapters
 - Codex wrapper, A2A, webhook SSE streaming
 - Web UI (`status` serves JSON at `/api/status` for now)
 - Config-editing CLI commands (`connect`, `add`, `link`, `allow`); edit `bridge.yaml` directly

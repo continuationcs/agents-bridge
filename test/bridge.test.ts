@@ -139,7 +139,8 @@ test('approval: only the initiator can approve; tool runs after approve', async 
     im.receive({ userId: 'U2', text: 'delete 42', channelName: 'boss' });
     await bridge.idle();
     const t = im.transcript().join('\n');
-    assert.match(t, /🔐 boss wants to run fake\.delete_thing/);
+    assert.match(t, /🔐 boss wants to run `fake\.delete_thing`/);
+    assert.match(t, /expires in 5s/);
     assert.match(t, /Only bob can answer that/);
     assert.match(t, /✅ Approved by bob/);
     assert.match(t, /deleted 42/);
@@ -234,5 +235,57 @@ routes: [ { from: "slack:*", to: hook } ]
   } finally {
     await bridge.stop();
     http.close();
+  }
+});
+
+test('approval buttons: wrong person is told privately, right person approves, message shows outcome', async () => {
+  const boss = scripted('boss', async (mcp) => text(await mcp.callTool({ name: 'fake__delete_thing', arguments: { id: '9' } })));
+  const im = new FakeIm().withButtons();
+  const bridge = new Bridge({ cfg: parseConfig(yaml()), store: new Store(':memory:'), ims: [im], agents: new Map([['boss', boss]]), log: () => {} });
+  await bridge.start();
+  im.onSend((m) => {
+    if (!m.text.startsWith('🔐')) return;
+    setTimeout(() => {
+      const id = [...im.choiceMessages.keys()].at(-1)!;
+      im.click(id, 'Approve', 'U1'); // alice: not the initiator
+      im.click(id, 'Approve', 'U2'); // bob: the initiator
+      im.click(id, 'Deny', 'U2'); // too late, already decided
+    }, 10);
+  });
+  try {
+    im.receive({ userId: 'U2', text: 'delete 9', channelName: 'boss' });
+    await bridge.idle();
+    const [msg] = [...im.choiceMessages.values()];
+    assert.equal(msg?.outcome, '✅ Approved by bob.');
+    assert.deepEqual(im.notices.map((n) => [n.userId, n.text]), [
+      ['U1', 'Only bob can decide this.'],
+      ['U2', 'This choice has already been decided or has expired.'],
+    ]);
+    assert.match(im.transcript().join('\n'), /deleted 9/);
+  } finally {
+    await bridge.stop();
+  }
+});
+
+test('budget: each turn gets what is left, and an exhausted budget stops the turn', async () => {
+  const seen: (number | undefined)[] = [];
+  const cc: AgentAdapter = { name: 'echo', async run(t) { seen.push(t.budgetUsd); return { text: 'ok', costUsd: 0.6 }; } };
+  const im = new FakeIm();
+  const bridge = new Bridge({
+    cfg: parseConfig(yaml('', '  - { match: { agent: echo }, budget_usd: 1 }')),
+    store: new Store(':memory:'), ims: [im], agents: new Map([['echo', cc]]), log: () => {},
+  });
+  await bridge.start();
+  try {
+    for (const t of ['one', 'two', 'three']) {
+      im.receive({ userId: 'U1', text: t });
+      await bridge.idle();
+    }
+    assert.equal(seen[0], 1);
+    assert.ok(Math.abs(seen[1]! - 0.4) < 1e-9);
+    assert.equal(seen.length, 2, 'third turn never reaches the agent');
+    assert.match(im.transcript().join('\n'), /used its \$1 budget/);
+  } finally {
+    await bridge.stop();
   }
 });

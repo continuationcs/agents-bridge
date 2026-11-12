@@ -73,6 +73,8 @@ export class ClaudeCodeAgent implements AgentAdapter {
       '--allowedTools', ['mcp__bridge', ...this.cfg.allowed_tools].join(','),
     ];
     if (resume) args.push('--resume', resume);
+    // Hard cap for this turn: whatever is left of the conversation budget.
+    if (turn.budgetUsd !== undefined) args.push('--max-budget-usd', turn.budgetUsd.toFixed(2));
     if (this.cfg.model) args.push('--model', this.cfg.model);
 
     try {
@@ -104,8 +106,13 @@ export class ClaudeCodeAgent implements AgentAdapter {
               if (block.type === 'tool_use') turn.onProgress?.(describeToolUse(block.name, block.input));
             }
           } else if (ev.type === 'result') {
+            const overBudget = /budget/i.test(String(ev.subtype ?? ''));
             result = {
-              text: ev.is_error ? `⚠️ ${ev.result ?? ev.subtype ?? 'Claude Code failed'}` : String(ev.result ?? ''),
+              text: overBudget
+                ? `💸 Stopped: this turn reached the conversation's remaining budget ($${turn.budgetUsd?.toFixed(2)}). Send "reset" to start a new conversation with a fresh budget.`
+                : ev.is_error
+                  ? `⚠️ ${ev.result ?? ev.subtype ?? 'Claude Code failed'}`
+                  : String(ev.result ?? ''),
               agentSessionId: ev.session_id ?? sessionId,
               costUsd: typeof ev.total_cost_usd === 'number' ? ev.total_cost_usd : undefined,
             };

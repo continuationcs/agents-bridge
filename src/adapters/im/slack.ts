@@ -2,7 +2,7 @@ import { SocketModeClient } from '@slack/socket-mode';
 import { WebClient } from '@slack/web-api';
 import type { InboundMessage } from '../../core/router.ts';
 import { toSlackMrkdwn } from './slack-format.ts';
-import type { ImAdapter, OutboundMessage } from './types.ts';
+import type { Choice, ImAdapter, InboundAction, OutboundMessage } from './types.ts';
 
 /**
  * Slack over Socket Mode (outbound WebSocket, no public URL).
@@ -22,7 +22,20 @@ export class SlackAdapter implements ImAdapter {
     this.socket = new SocketModeClient({ appToken: opts.appToken });
   }
 
-  async start(onMessage: (msg: InboundMessage) => void) {
+  async start(onMessage: (msg: InboundMessage) => void, onAction?: (action: InboundAction) => void) {
+    this.socket.on('interactive', async ({ body, ack }: { body: any; ack: () => Promise<void> }) => {
+      await ack();
+      if (body?.type !== 'block_actions' || !onAction) return;
+      for (const a of body.actions ?? []) {
+        onAction({
+          platform: 'slack',
+          channelId: body.channel?.id ?? body.container?.channel_id,
+          userId: body.user?.id,
+          messageId: body.container?.message_ts ?? body.message?.ts,
+          value: String(a.value ?? ''),
+        });
+      }
+    });
     const auth = await this.web.auth.test();
     this.botUserId = String(auth.user_id);
     this.socket.on('message', async ({ event, ack }: { event: any; ack: () => Promise<void> }) => {
@@ -58,6 +71,46 @@ export class SlackAdapter implements ImAdapter {
       unfurl_links: false,
     });
     return String(res.ts);
+  }
+
+  async sendChoice(msg: OutboundMessage, choices: Choice[]): Promise<string> {
+    const text = toSlackMrkdwn(msg.text);
+    const res = await this.web.chat.postMessage({
+      channel: msg.channelId,
+      thread_ts: msg.isDM ? undefined : msg.threadId,
+      text,
+      blocks: [
+        { type: 'section', text: { type: 'mrkdwn', text: text.slice(0, 3000) } },
+        {
+          type: 'actions',
+          elements: choices.map((c, i) => ({
+            type: 'button',
+            action_id: `choice_${i}`,
+            text: { type: 'plain_text', text: c.label },
+            value: c.value,
+            ...(c.style ? { style: c.style } : {}),
+          })),
+        },
+      ],
+    });
+    return String(res.ts);
+  }
+
+  async resolveChoice(channelId: string, messageId: string, text: string, outcome: string) {
+    const body = toSlackMrkdwn(text);
+    await this.web.chat.update({
+      channel: channelId,
+      ts: messageId,
+      text: `${body}\n${outcome}`,
+      blocks: [
+        { type: 'section', text: { type: 'mrkdwn', text: body.slice(0, 3000) } },
+        { type: 'context', elements: [{ type: 'mrkdwn', text: toSlackMrkdwn(outcome) }] },
+      ],
+    });
+  }
+
+  async notifyUser(channelId: string, userId: string, text: string) {
+    await this.web.chat.postEphemeral({ channel: channelId, user: userId, text: toSlackMrkdwn(text) });
   }
 
   async edit(channelId: string, messageId: string, text: string) {

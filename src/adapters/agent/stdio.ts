@@ -46,6 +46,7 @@ export class StdioAgent implements AgentAdapter {
           id,
           text: turn.text,
           session_id: turn.agentSessionId ?? null,
+          budget_usd: turn.budgetUsd ?? null,
           envelope: turn.envelope,
           mcp: { url: turn.mcp.url },
         }) + '\n',

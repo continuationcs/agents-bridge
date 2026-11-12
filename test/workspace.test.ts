@@ -117,7 +117,7 @@ routes: [ { from: "slack:*", when: { sender: [alice] }, to: cc } ]
 
     const t = im.transcript().join('\n');
     assert.match(t, /🌿 bridge\/x: 2 commits/);
-    assert.match(t, /Cancelled\./);
+    assert.match(t, /Cancelled by alice\./);
     assert.match(t, /✅ merged/);
     assert.match(t, /🗑 discarded/);
     assert.deepEqual(calls, ['merge', 'discard']);

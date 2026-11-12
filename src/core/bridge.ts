@@ -2,7 +2,8 @@ import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 import type { BridgeConfig, TrustLevel } from '../config/schema.ts';
 import { createAgent } from '../adapters/agent/index.ts';
 import type { AgentAdapter, AgentReply, Workspace } from '../adapters/agent/types.ts';
-import type { ImAdapter } from '../adapters/im/types.ts';
+import type { Choice, ImAdapter, InboundAction } from '../adapters/im/types.ts';
+import { randomUUID } from 'node:crypto';
 import { McpHub, type HubBackend, type SessionGrant, type ToolResult } from '../mcp/hub.ts';
 import { ToolHub } from '../mcp/tools.ts';
 import { parseDuration } from './address.ts';
@@ -82,6 +83,8 @@ export class Bridge implements HubBackend {
   private readonly chains = new Map<string, Promise<void>>();
   private readonly active = new Map<string, TurnCtx>();
   private readonly waiters = new Map<string, Waiter[]>();
+  /** Open button choices by id: who may click, and how to settle them. */
+  private readonly choices = new Map<string, { allowed: Set<string>; settle: (r: { by: string; value: string }) => void }>();
   private startedAt = 0;
 
   constructor(opts: BridgeOptions) {
@@ -100,7 +103,10 @@ export class Bridge implements HubBackend {
   async start(): Promise<{ mcpUrl: string }> {
     const mcpUrl = await this.hub.listen(this.cfg.server.host, this.cfg.server.port);
     for (const im of this.ims.values()) {
-      await im.start((msg) => this.handleInbound(msg).catch((e) => this.log(`inbound error: ${e?.stack ?? e}`)));
+      await im.start(
+        (msg) => this.handleInbound(msg).catch((e) => this.log(`inbound error: ${e?.stack ?? e}`)),
+        (action) => this.handleAction(action).catch((e) => this.log(`action error: ${e?.stack ?? e}`)),
+      );
       this.log(`connected ${im.platform}`);
     }
     this.startedAt = Date.now();
@@ -203,12 +209,19 @@ export class Bridge implements HubBackend {
 
   /** status / merge / discard on the conversation's branch. Runs in the thread's queue, so never mid-turn. */
   private async runCommand(command: 'status' | 'merge' | 'discard', ws: Workspace, key: string, thread: ThreadRef, who: string) {
-    const confirm = async (prompt: string) => {
-      await this.send(thread, `${prompt}\nReply \`yes\` to go ahead; anything else cancels.`);
-      const answer = await this.waitFor(key, [who], 10 * 60e3, () => true);
-      if (answer && APPROVE.test(answer.text)) return true;
-      await this.send(thread, answer ? 'Cancelled.' : 'No answer in 10 minutes — cancelled.');
-      return false;
+    const confirm = async (prompt: string, action: Choice) => {
+      const answer = await this.choose({
+        key,
+        thread,
+        text: prompt,
+        choices: [action, { label: 'Cancel', value: 'cancel' }],
+        allowed: [who],
+        timeoutMs: 10 * 60e3,
+        typedHint: 'Reply `yes` to go ahead; anything else cancels.',
+        typed: (t) => (APPROVE.test(t) ? action.value : 'cancel'),
+        outcome: (r) => (!r ? '⌛ No answer in 10 minutes — cancelled.' : r.value === 'cancel' ? `Cancelled by ${r.by}.` : `${action.label} — confirmed by ${r.by}.`),
+      });
+      return answer?.value === action.value;
     };
     try {
       if (command === 'status') {
@@ -216,7 +229,7 @@ export class Bridge implements HubBackend {
       } else if (command === 'merge') {
         const preview = ws.previewMerge(key);
         if (!preview.ok) return void (await this.send(thread, `⚠️ ${preview.reason}`));
-        if (!(await confirm(preview.summary))) return;
+        if (!(await confirm(preview.summary, { label: 'Merge', value: 'merge', style: 'primary' }))) return;
         const result = ws.merge(key);
         this.store.deleteSession(key);
         this.store.trace(key, 'merged', who, { result });
@@ -224,7 +237,7 @@ export class Bridge implements HubBackend {
       } else {
         const lost = ws.previewDiscard(key);
         if (lost === undefined) return void (await this.send(thread, 'This conversation has no branch to discard.'));
-        if (lost && !(await confirm(`🗑 This throws away ${lost}`))) return;
+        if (lost && !(await confirm(`🗑 This throws away ${lost}`, { label: 'Discard', value: 'discard', style: 'danger' }))) return;
         const result = ws.discard(key);
         this.store.deleteSession(key);
         this.store.trace(key, 'discarded', who, {});
@@ -322,6 +335,10 @@ export class Bridge implements HubBackend {
   /** Run one agent turn with a session-scoped MCP grant. */
   private async invoke(ctx: TurnCtx, text: string, agentSessionId: string | undefined, onProgress?: (l: string) => void): Promise<AgentReply> {
     const adapter = this.agent(ctx.agent);
+    const budgetUsd = this.remainingBudget(ctx);
+    if (budgetUsd !== undefined && budgetUsd <= 0) {
+      throw new Error(`the $${ctx.envelope.budgetUsd} budget for this conversation is used up — send "reset" to start over`);
+    }
     const grant = this.hub.grant({ sessionKey: ctx.sessionKey, agent: ctx.agent });
     this.active.set(ctx.sessionKey, ctx);
     try {
@@ -329,6 +346,7 @@ export class Bridge implements HubBackend {
         envelope: ctx.envelope,
         text,
         agentSessionId,
+        budgetUsd,
         mcp: { url: grant.url, token: grant.token },
         onProgress,
         onSessionId: (id) => this.store.updateSession(ctx.sessionKey, { agent_session_id: id }),
@@ -342,6 +360,13 @@ export class Bridge implements HubBackend {
       grant.revoke();
       this.active.delete(ctx.sessionKey);
     }
+  }
+
+  /** What's left of the conversation budget (shared by every agent in a delegation chain). */
+  private remainingBudget(ctx: TurnCtx): number | undefined {
+    if (ctx.envelope.budgetUsd === undefined) return undefined;
+    const spent = this.store.getSession(ctx.rootKey)?.spent_usd ?? 0;
+    return Math.max(0, ctx.envelope.budgetUsd - spent);
   }
 
   // ───────────────────────── MCP backend ─────────────────────────
@@ -431,18 +456,23 @@ export class Bridge implements HubBackend {
     if (rule) {
       const approvers = rule.approvers.map((a) => (a === 'initiator' ? ctx.envelope.initiator : a));
       const preview = JSON.stringify(args).slice(0, 500);
-      await this.send(
-        ctx.thread,
-        `🔐 ${ctx.agent} wants to run ${qualified} ${preview}\nReply "approve" or "deny" — ${approvers.join(', ')} can decide (expires in ${Math.round(rule.timeoutMs / 60e3)}m).`,
-      );
-      const decision = await this.waitFor(ctx.rootKey, approvers, rule.timeoutMs, (t) => APPROVE.test(t) || DENY.test(t));
-      const approved = !!decision && APPROVE.test(decision.text);
+      const decision = await this.choose({
+        key: ctx.rootKey,
+        thread: ctx.thread,
+        text: `🔐 ${ctx.agent} wants to run \`${qualified}\` ${preview}\n${approvers.join(', ')} can decide (expires in ${rule.timeoutMs < 60e3 ? `${Math.round(rule.timeoutMs / 1e3)}s` : `${Math.round(rule.timeoutMs / 60e3)}m`}).`,
+        choices: [
+          { label: 'Approve', value: 'approve', style: 'primary' },
+          { label: 'Deny', value: 'deny', style: 'danger' },
+        ],
+        allowed: approvers,
+        timeoutMs: rule.timeoutMs,
+        typedHint: 'Reply "approve" or "deny".',
+        typed: (t) => (APPROVE.test(t) ? 'approve' : DENY.test(t) ? 'deny' : undefined),
+        outcome: (r) => (!r ? '⌛ Approval expired.' : r.value === 'approve' ? `✅ Approved by ${r.by}.` : `🚫 Denied by ${r.by}.`),
+      });
+      const approved = decision?.value === 'approve';
       this.store.trace(ctx.sessionKey, 'approval', decision?.by ?? 'timeout', { tool: qualified, approved });
-      if (!approved) {
-        await this.send(ctx.thread, decision ? `🚫 Denied by ${decision.by}.` : '⌛ Approval expired.');
-        return { text: decision ? `denied by ${decision.by}` : 'approval timed out', isError: true };
-      }
-      await this.send(ctx.thread, `✅ Approved by ${decision.by}.`);
+      if (!approved) return { text: decision ? `denied by ${decision.by}` : 'approval timed out', isError: true };
     }
     const result = await this.tools.callTool(server, tool, args);
     const content = (result.content ?? []) as Array<{ type: string; text?: string }>;
@@ -524,6 +554,88 @@ export class Bridge implements HubBackend {
       if ((p as Record<string, unknown>)[platform] === userId) return { id, trust: p.trust };
     }
     return undefined;
+  }
+
+  /**
+   * Ask the thread to decide. With buttons where the IM has them, otherwise (and always also) by
+   * typed reply. Only `allowed` people count; the message is updated with the outcome.
+   */
+  private async choose(opts: {
+    key: string;
+    thread: ThreadRef;
+    text: string;
+    choices: Choice[];
+    allowed: string[];
+    timeoutMs: number;
+    typedHint: string;
+    typed: (text: string) => string | undefined;
+    outcome: (r: { by: string; value: string } | undefined) => string;
+  }): Promise<{ by: string; value: string } | undefined> {
+    const im = this.ims.get(opts.thread.platform);
+    const id = randomUUID().slice(0, 8);
+    let messageId: string | undefined;
+    if (im?.sendChoice) {
+      messageId = await im.sendChoice(
+        { channelId: opts.thread.channelId, threadId: opts.thread.threadId, isDM: opts.thread.isDM, text: opts.text },
+        opts.choices.map((c) => ({ ...c, value: `${id}|${c.value}` })),
+      );
+    } else {
+      await this.send(opts.thread, `${opts.text}\n${opts.typedHint}`);
+    }
+
+    const result = await new Promise<{ by: string; value: string } | undefined>((resolve) => {
+      const allowed = new Set(opts.allowed);
+      let settled = false;
+      const waiter: Waiter = {
+        allowed,
+        accepts: (t) => opts.typed(t.trim()) !== undefined,
+        offer: (personId, t) => {
+          const value = opts.typed(t.trim());
+          if (!allowed.has(personId) || value === undefined) return false;
+          settle({ by: personId, value });
+          return true;
+        },
+      };
+      const timer = setTimeout(() => settle(undefined), opts.timeoutMs);
+      const settle = (r: { by: string; value: string } | undefined) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.choices.delete(id);
+        const list = this.waiters.get(opts.key) ?? [];
+        const i = list.indexOf(waiter);
+        if (i >= 0) list.splice(i, 1);
+        if (!list.length) this.waiters.delete(opts.key);
+        resolve(r);
+      };
+      this.choices.set(id, { allowed, settle });
+      this.waiters.set(opts.key, [...(this.waiters.get(opts.key) ?? []), waiter]);
+    });
+
+    const outcome = opts.outcome(result);
+    if (messageId && im?.resolveChoice) {
+      await im.resolveChoice(opts.thread.channelId, messageId, opts.text, outcome).catch(() => this.send(opts.thread, outcome));
+    } else {
+      await this.send(opts.thread, outcome);
+    }
+    return result;
+  }
+
+  /** A button click: settle the choice if the clicker may decide. */
+  async handleAction(action: InboundAction) {
+    const [id, value] = action.value.split('|');
+    const im = this.ims.get(action.platform);
+    const choice = id ? this.choices.get(id) : undefined;
+    if (!choice || value === undefined) {
+      await im?.notifyUser?.(action.channelId, action.userId, 'This choice has already been decided or has expired.');
+      return;
+    }
+    const person = this.person(action.platform, action.userId);
+    if (!person || !choice.allowed.has(person.id)) {
+      await im?.notifyUser?.(action.channelId, action.userId, `Only ${[...choice.allowed].join(', ')} can decide this.`);
+      return;
+    }
+    choice.settle({ by: person.id, value });
   }
 
   private waitFor(

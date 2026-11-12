@@ -6,6 +6,8 @@ export interface AgentTurn {
   text: string;
   /** The agent's own session id from the previous turn in this bridge session, if any. */
   agentSessionId?: string;
+  /** USD left in this conversation's budget; agents should stop before spending more. */
+  budgetUsd?: number;
   /** Session-scoped MCP endpoint the agent can call back into (send_message, ask_human, delegate, tools). */
   mcp: { url: string; token: string };
   /** Short progress lines ("Reading src/…"). */
