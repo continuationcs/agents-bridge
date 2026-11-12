@@ -62,9 +62,10 @@ export interface BridgeOptions {
 const APPROVE = /^(approve|approved|yes|y|ok|lgtm|批准|同意|可以|确认|好|好的|是)$/i;
 
 /** A message that is exactly one of these words is a workspace command, not a prompt. */
-const COMMANDS: Record<string, 'status' | 'merge' | 'discard'> = {
+const COMMANDS: Record<string, 'status' | 'merge' | 'discard' | 'pr'> = {
   status: 'status', 状态: 'status',
   merge: 'merge', 合并: 'merge',
+  pr: 'pr', 开pr: 'pr',
   discard: 'discard', 丢弃: 'discard', 放弃: 'discard',
 };
 const DENY = /^(deny|denied|no|n|reject|拒绝|不行)$/i;
@@ -208,7 +209,7 @@ export class Bridge implements HubBackend {
   }
 
   /** status / merge / discard on the conversation's branch. Runs in the thread's queue, so never mid-turn. */
-  private async runCommand(command: 'status' | 'merge' | 'discard', ws: Workspace, key: string, thread: ThreadRef, who: string) {
+  private async runCommand(command: 'status' | 'merge' | 'discard' | 'pr', ws: Workspace, key: string, thread: ThreadRef, who: string) {
     const confirm = async (prompt: string, action: Choice) => {
       const answer = await this.choose({
         key,
@@ -226,6 +227,16 @@ export class Bridge implements HubBackend {
     try {
       if (command === 'status') {
         await this.send(thread, ws.status(key) ?? 'This conversation has no branch yet — it gets one with the first change.');
+      } else if (command === 'pr') {
+        if (!ws.previewPr || !ws.pr) {
+          return void (await this.send(thread, '⚠️ No git token is configured for this agent — add `git_token` to it in bridge.yaml.'));
+        }
+        const preview = ws.previewPr(key);
+        if (!preview.ok) return void (await this.send(thread, `⚠️ ${preview.reason}`));
+        if (!(await confirm(preview.summary, { label: 'Open PR', value: 'pr', style: 'primary' }))) return;
+        const result = ws.pr(key);
+        this.store.trace(key, 'pr', who, { result });
+        await this.send(thread, result);
       } else if (command === 'merge') {
         const preview = ws.previewMerge(key);
         if (!preview.ok) return void (await this.send(thread, `⚠️ ${preview.reason}`));

@@ -135,11 +135,8 @@ export function squashMerge(opts: WorktreeOpts): { commit: string; message: stri
     tryGit(root, ['reset', '--merge']);
     throw new Error(`merge conflicts with ${st.base} in: ${conflicts.split('\n').filter(Boolean).join(', ') || 'unknown files'}`);
   }
-  const subjects = st.commits.map((c) => c.replace(/^\S+\s/, '')).reverse();
-  const message =
-    subjects.length === 1
-      ? subjects[0]!
-      : `${subjects[0]}\n\nSquashed from ${st.branch}:\n${subjects.map((s) => `- ${s}`).join('\n')}`;
+  const { title, bullets } = summarize(st);
+  const message = st.commits.length === 1 ? title : `${title}\n\nSquashed from ${st.branch}:\n${bullets}`;
   git(root, ['commit', '-q', '-m', message]);
   const commit = git(root, ['rev-parse', '--short', 'HEAD']);
   removeWorktree(opts);
@@ -185,4 +182,54 @@ export function sessionSlug(sessionKey: string): string {
 
 export function expandHome(p: string) {
   return p === '~' ? homedir() : p.startsWith('~/') ? join(homedir(), p.slice(2)) : p;
+}
+
+/** Commit subjects oldest-first as a title + bullet body (used for squash messages and PRs). */
+export function summarize(st: WorktreeStatus): { title: string; bullets: string } {
+  const subjects = st.commits.map((c) => c.replace(/^\S+\s/, '')).reverse();
+  return { title: subjects[0] ?? st.branch, bullets: subjects.map((x) => `- ${x}`).join('\n') };
+}
+
+/** Why the branch can't be pushed as a PR right now, or undefined. */
+export function prBlocker(opts: WorktreeOpts, st: WorktreeStatus): string | undefined {
+  const { root } = locate(opts);
+  if (st.dirty.length) return `the branch has uncommitted changes (${st.dirty.length} files) — ask the agent to commit them, or discard`;
+  if (!st.commits.length) return `there is nothing to propose: ${st.branch} has no commits beyond ${st.base}`;
+  if (!tryGit(root, ['remote', 'get-url', 'origin'])) return 'the repository has no "origin" remote';
+  return undefined;
+}
+
+/**
+ * Push the session branch to origin and open (or reuse) a pull request into its base.
+ * `token` authenticates both git and gh; nothing is written to git config.
+ */
+export function pushPullRequest(opts: WorktreeOpts, token: string): { url: string; created: boolean } {
+  const st = worktreeStatus(opts);
+  if (!st) throw new Error('this conversation has no branch');
+  const blocker = prBlocker(opts, st);
+  if (blocker) throw new Error(blocker);
+  const { root } = locate(opts);
+  const env = { ...process.env, GH_TOKEN: token, GIT_TERMINAL_PROMPT: '0' };
+  const run = (cmd: string, args: string[]) => {
+    try {
+      return execFileSync(cmd, args, { cwd: root, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    } catch (err) {
+      const e = err as { stderr?: string; message: string };
+      throw new Error(`${cmd} ${args[0]}: ${(e.stderr || e.message).trim().split('\n').slice(-3).join(' ')}`);
+    }
+  };
+  if (!run('git', ['ls-remote', '--heads', 'origin', st.base])) {
+    throw new Error(`${st.base} doesn't exist on origin yet — push it first`);
+  }
+  run('git', ['-c', 'credential.helper=', '-c', 'credential.helper=!gh auth git-credential', 'push', '-u', 'origin', st.branch]);
+  try {
+    const url = run('gh', ['pr', 'view', st.branch, '--json', 'url,state', '--jq', 'select(.state == "OPEN") | .url']);
+    if (url) return { url, created: false };
+  } catch {
+    /* no PR yet */
+  }
+  const { title, bullets } = summarize(st);
+  const body = `${bullets}\n\n---\nOpened from a chat conversation via agents-bridge (branch \`${st.branch}\`).`;
+  const url = run('gh', ['pr', 'create', '--head', st.branch, '--base', st.base, '--title', title, '--body', body]);
+  return { url: url.split('\n').pop()!, created: true };
 }
