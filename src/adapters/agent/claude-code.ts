@@ -26,7 +26,7 @@ const BRIDGE_PROMPT = `You are being reached through agents-bridge. Messages com
 - Your final answer is posted back to the conversation automatically.
 - Use the "bridge" MCP tools to post an interim update (send_message), ask the person a question and wait for the reply (ask_human), hand work to another agent (delegate), or call the external tools you were granted.
 - Keep chat replies short and readable; the conversation is a chat thread, not a terminal.
-- Reply in the language the person writes in, even when bridge notes like this one are in English.`;
+- Reply in the language of the person's own message, even when bridge notes like this one, attached files, screenshots or tool output are in another language. If their message has no words, use the language of their earlier messages.`;
 
 /** Runs Claude Code headless (`claude -p`) per turn, resuming the same Claude session across turns of a thread. */
 export class ClaudeCodeAgent implements AgentAdapter {
