@@ -49,6 +49,24 @@ export function setSecret(name: string, value: string) {
   });
 }
 
+/** Read a stored secret, or undefined when there is none (no error). */
+export function readSecret(name: string): string | undefined {
+  try {
+    return resolveSecret(`secret:${name}`);
+  } catch {
+    return undefined;
+  }
+}
+
+export function deleteSecret(name: string) {
+  if (process.platform !== 'darwin') return;
+  try {
+    execFileSync('security', ['delete-generic-password', '-s', SERVICE, '-a', name], { stdio: 'ignore' });
+  } catch {
+    /* not there */
+  }
+}
+
 function envName(name: string) {
   return `AGENTS_BRIDGE_SECRET_${name.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`;
 }

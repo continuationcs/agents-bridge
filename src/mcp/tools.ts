@@ -5,6 +5,12 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { McpError, type Tool } from '@modelcontextprotocol/sdk/types.js';
 import type { HttpToolServerConfig, ToolServerConfig } from '../config/schema.ts';
 import { resolveSecret, resolveTemplate } from '../secrets.ts';
+import { BridgeOAuthProvider, NeedsSignIn, type OAuthStorage } from './oauth.ts';
+
+export interface ToolHubOptions {
+  /** Needed for tool servers with `oauth`: where tokens live and the redirect URL they were issued for. */
+  oauth?: { storage: OAuthStorage; redirectUrl: string };
+}
 
 export interface ProxiedTool {
   server: string;
@@ -20,8 +26,21 @@ export class ToolHub {
   private readonly clients = new Map<string, Promise<Client>>();
   private readonly toolCache = new Map<string, Tool[]>();
 
-  constructor(servers: Record<string, ToolServerConfig>) {
+  private readonly opts: ToolHubOptions;
+
+  constructor(servers: Record<string, ToolServerConfig>, opts: ToolHubOptions = {}) {
     this.servers = servers;
+    this.opts = opts;
+  }
+
+  config(server: string): ToolServerConfig | undefined {
+    return this.servers[server];
+  }
+
+  /** Forget the connection and cached tool list (e.g. after signing in again). */
+  async reset(server: string) {
+    this.toolCache.delete(server);
+    await this.drop(server);
   }
 
   /** Config reload: new servers become available; changed or removed ones are disconnected. */
@@ -94,7 +113,7 @@ export class ToolHub {
     if (!p) {
       const cfg = this.servers[server];
       if (!cfg) throw new Error(`unknown tool server "${server}"`);
-      p = 'url' in cfg ? connectHttp(cfg) : (async () => {
+      p = 'url' in cfg ? connectHttp(server, cfg, this.opts) : (async () => {
         const env: Record<string, string> = { ...(process.env as Record<string, string>) };
         for (const [k, v] of Object.entries(cfg.env)) env[k] = resolveSecret(v);
         const client = newClient();
@@ -112,11 +131,17 @@ function newClient() {
   return new Client({ name: 'agents-bridge', version: '0.1.0' });
 }
 
-async function connectHttp(cfg: HttpToolServerConfig): Promise<Client> {
+async function connectHttp(name: string, cfg: HttpToolServerConfig, opts: ToolHubOptions): Promise<Client> {
   const headers: Record<string, string> = {};
   for (const [k, v] of Object.entries(cfg.headers)) headers[k] = resolveTemplate(v);
   const url = new URL(cfg.url);
-  const init = { requestInit: { headers } };
+  let authProvider: BridgeOAuthProvider | undefined;
+  if (cfg.oauth) {
+    if (!opts.oauth) throw new Error(`${name}: OAuth tool servers need the bridge's OAuth storage`);
+    if (!opts.oauth.storage.get(name).tokens) throw new NeedsSignIn(name);
+    authProvider = new BridgeOAuthProvider(name, cfg, opts.oauth.storage, opts.oauth.redirectUrl);
+  }
+  const init = { requestInit: { headers }, authProvider };
   if (cfg.transport !== 'sse') {
     const client = newClient();
     try {
@@ -124,7 +149,7 @@ async function connectHttp(cfg: HttpToolServerConfig): Promise<Client> {
       return client;
     } catch (err) {
       const e = describe(err, cfg.url);
-      if (cfg.transport === 'streamable-http' || /unauthorized/.test(e.message)) throw e;
+      if (cfg.transport === 'streamable-http' || /unauthorized|not signed in/.test(e.message)) throw e;
       // auto: older servers only speak SSE (GET /sse + POST /messages).
     }
   }
@@ -138,6 +163,7 @@ async function connectHttp(cfg: HttpToolServerConfig): Promise<Client> {
 }
 
 function describe(err: unknown, url: string): Error {
+  if (err instanceof NeedsSignIn) return err;
   const msg = (err as Error)?.message ?? String(err);
   if (/\b401\b|unauthori[sz]ed/i.test(msg)) return new Error(`${url}: unauthorized — check the headers (API key / bearer token)`);
   return new Error(`${url}: ${msg}`);

@@ -20,6 +20,8 @@ export interface HubBackend {
   listTools(grant: SessionGrant): Promise<Tool[]>;
   callTool(grant: SessionGrant, name: string, args: Record<string, unknown>): Promise<ToolResult>;
   status(): unknown;
+  /** Other local routes (dashboard, OAuth); return false to fall through. */
+  handleHttp?(req: IncomingMessage, res: import('node:http').ServerResponse, url: URL): Promise<boolean>;
 }
 
 /**
@@ -70,6 +72,7 @@ export class McpHub {
       res.end(JSON.stringify(this.backend.status()));
       return;
     }
+    if (!url.pathname.startsWith('/mcp/') && this.backend.handleHttp && (await this.backend.handleHttp(req, res, url))) return;
     const m = /^\/mcp\/([A-Za-z0-9_-]+)$/.exec(url.pathname);
     const grant = m ? this.grants.get(m[1]!) : undefined;
     if (!grant) {

@@ -101,6 +101,22 @@ const HttpToolServer = z
     /** streamable-http (current spec) or sse (older servers); auto tries streamable-http, then sse. */
     transport: z.enum(['auto', 'streamable-http', 'sse']).default('auto'),
     headers: z.record(z.string(), z.string()).default({}),
+    /**
+     * Sign in with OAuth (run `agents-bridge auth <server>` once). `true` uses dynamic client
+     * registration; servers without it need a pre-registered `client_id` (+ `client_secret`).
+     */
+    oauth: z
+      .union([
+        z.literal(true),
+        z
+          .object({
+            scopes: z.array(z.string()).optional(),
+            client_id: z.string().optional(),
+            client_secret: SecretRef.optional(),
+          })
+          .strict(),
+      ])
+      .optional(),
     description: z.string().optional(),
   })
   .strict();

@@ -118,8 +118,20 @@ node dist/cli.js worktrees prune --older-than 7d    # remove idle ones with noth
 ## Tool servers
 
 - **Local** (`command`, `args`, `env`): the bridge starts the MCP server as a child process and talks stdio.
-- **Remote** (`url`, `headers`): Streamable HTTP, falling back to the older SSE transport (`transport: auto | streamable-http | sse`). A header value can be a whole secret ref (`secret:x`, `env:X`) or contain `${secret:x}` / `${env:X}`, e.g. `"Bearer ${secret:github_token}"`. OAuth sign-in flows are not supported yet: use servers that accept an API key or token in a header.
+- **Remote** (`url`, `headers`): Streamable HTTP, falling back to the older SSE transport (`transport: auto | streamable-http | sse`). A header value can be a whole secret ref (`secret:x`, `env:X`) or contain `${secret:x}` / `${env:X}`, e.g. `"Bearer ${secret:github_token}"`. Servers that sign in with OAuth take `oauth: true` instead (below).
+- **OAuth** (`url`, `oauth: true`): run `agents-bridge auth <server>` once, or press **Connect** in the dashboard. The browser opens the provider's consent page and comes back to `http://127.0.0.1:7377/oauth/callback`; the bridge registers itself (dynamic client registration), uses PKCE, keeps the tokens in the OS keychain and refreshes them. A tool call never opens a browser: when the grant is gone it fails with "not signed in — run agents-bridge auth <server>". Providers without dynamic registration need a pre-registered app: `oauth: { client_id: …, client_secret: secret:…, scopes: [...] }`. `agents-bridge auth` lists sign-in state; `--sign-out` forgets the tokens.
 - A dropped connection or expired remote session is reconnected once per call. `agents-bridge doctor` lists each server's tools.
+
+## Dashboard
+
+`agents-bridge dashboard` opens `http://127.0.0.1:7377/` (served by the running bridge, to this machine only):
+
+- **Waiting for you**: pending approvals and confirmations, with their buttons. You decide as the config's `owner`, the same as answering in the chat.
+- **Conversations**: each session with its agent, cost, activity and branch; merge or discard a branch (shows what it will do first, waits for any running turn, and posts the result to the chat thread).
+- **Activity**: the audit trail, for everything or one conversation.
+- **Tool servers**: reachable or not, tool counts, OAuth Connect / Sign out.
+
+Writes must be same-origin JSON and requests must carry a loopback `Host`, so other web pages and DNS-rebinding tricks can't drive it.
 
 ## Agent protocols
 
@@ -141,6 +153,8 @@ src/
   core/store.ts          SQLite: sessions, queue, trace (redacted)
   mcp/hub.ts             per-turn MCP endpoints over streamable HTTP
   mcp/tools.ts           external MCP tool servers (stdio or HTTP)
+  mcp/oauth.ts           OAuth sign-in for remote tool servers (keychain storage, browser flow)
+  web/                   local dashboard: JSON API + one self-contained page
   adapters/im/           slack, telegram, local console
   adapters/agent/        claude-code, webhook, stdio
 ```
@@ -149,6 +163,5 @@ src/
 
 - Discord adapter; Telegram tested end to end
 - Codex wrapper, A2A, webhook SSE streaming
-- Web UI (`status` serves JSON at `/api/status` for now)
 - Config-editing CLI commands (`connect`, `add`, `link`, `allow`); edit `bridge.yaml` directly
 - Strict policy on `tainted` envelopes (the flag is recorded but not enforced)

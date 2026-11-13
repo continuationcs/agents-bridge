@@ -6,6 +6,9 @@ import type { Choice, ImAdapter, InboundAction } from '../adapters/im/types.ts';
 import { randomUUID } from 'node:crypto';
 import { McpHub, type HubBackend, type SessionGrant, type ToolResult } from '../mcp/hub.ts';
 import { ToolHub } from '../mcp/tools.ts';
+import { keychainStorage, OAuthFlows, type OAuthStorage } from '../mcp/oauth.ts';
+import { handleWeb, localBaseUrl, type WebBackend, type WebChoice, type WebSession, type WebTool } from '../web/api.ts';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import { parseDuration } from './address.ts';
 import { minTrust, newEnvelope, type ContentBlock, type Envelope } from './envelope.ts';
 import { PolicyEngine } from './policy.ts';
@@ -60,6 +63,8 @@ export interface BridgeOptions {
   /** Pre-built agents (tests); anything missing is built from cfg.agents. */
   agents?: Map<string, AgentAdapter>;
   tools?: ToolHub;
+  /** OAuth tokens for tool servers (default: the OS keychain). */
+  oauthStorage?: OAuthStorage;
   /** Where attachments are downloaded (default: a temp dir). */
   filesDir?: string;
   log?: (line: string) => void;
@@ -76,7 +81,7 @@ const COMMANDS: Record<string, 'status' | 'merge' | 'discard' | 'pr'> = {
 };
 const DENY = /^(deny|denied|no|n|reject|拒绝|不行)$/i;
 
-export class Bridge implements HubBackend {
+export class Bridge implements HubBackend, WebBackend {
   private cfg: BridgeConfig;
   private router: Router;
   private policies: PolicyEngine;
@@ -93,7 +98,11 @@ export class Bridge implements HubBackend {
   private readonly active = new Map<string, TurnCtx>();
   private readonly waiters = new Map<string, Waiter[]>();
   /** Open button choices by id: who may click, and how to settle them. */
-  private readonly choices = new Map<string, { allowed: Set<string>; settle: (r: { by: string; value: string }) => void }>();
+  private readonly choices = new Map<
+    string,
+    { allowed: Set<string>; settle: (r: { by: string; value: string }) => void; key: string; text: string; options: Choice[]; at: number }
+  >();
+  readonly oauth: OAuthFlows;
   private startedAt = 0;
   private readonly filesDir: string;
   private housekeeping?: NodeJS.Timeout;
@@ -106,7 +115,13 @@ export class Bridge implements HubBackend {
     for (const im of opts.ims) this.ims.set(im.platform, im);
     for (const [k, v] of opts.agents ?? []) this.agents.set(k, v);
     this.injectedAgents = new Set(opts.agents?.keys() ?? []);
-    this.tools = opts.tools ?? new ToolHub(opts.cfg.tools);
+    const oauthStorage = opts.oauthStorage ?? keychainStorage;
+    const redirectUrl = `${localBaseUrl(opts.cfg.server)}/oauth/callback`;
+    this.tools = opts.tools ?? new ToolHub(opts.cfg.tools, { oauth: { storage: oauthStorage, redirectUrl } });
+    this.oauth = new OAuthFlows(() => this.cfg.tools, oauthStorage, redirectUrl, (server) => {
+      this.store.trace('-', 'oauth', 'web', { server, signedIn: this.oauth.status(server) === 'signed-in' });
+      void this.tools.reset(server);
+    });
     this.hub = new McpHub(this);
     this.log = opts.log ?? ((l) => console.log(l));
     this.filesDir = opts.filesDir ?? join(tmpdir(), 'agents-bridge-files');
@@ -642,6 +657,136 @@ export class Bridge implements HubBackend {
     };
   }
 
+  // ───────────────────────── dashboard ─────────────────────────
+
+  handleHttp(req: IncomingMessage, res: ServerResponse, url: URL) {
+    return handleWeb(this, req, res, url);
+  }
+
+  webSessions(): WebSession[] {
+    const busy = new Set([...this.active.values()].map((c) => c.rootKey));
+    return this.store.listSessions(200).map((s) => {
+      let branch: string | undefined;
+      let canMerge = false;
+      try {
+        const ws = this.agent(s.agent).workspace;
+        // The chat hint ("Reply `merge` …") is for IM; the dashboard has buttons.
+        branch = ws?.status(s.key)?.split(/\nReply `/)[0]?.trim();
+        canMerge = !!branch && !!ws?.previewMerge(s.key).ok;
+      } catch {
+        /* agent removed from config */
+      }
+      return {
+        key: s.key,
+        agent: s.agent,
+        platform: s.platform,
+        initiator: s.initiator,
+        createdAt: s.created_at,
+        lastActive: s.last_active,
+        spentUsd: s.spent_usd,
+        busy: busy.has(s.key) || this.chains.has(s.key),
+        branch,
+        canMerge,
+      };
+    });
+  }
+
+  webTrace(sessionKey: string | undefined, limit: number) {
+    return this.store
+      .readTrace({ sessionKey, limit })
+      .reverse() // newest first
+      .map((t) => ({ ts: t.ts, session: t.session_key, kind: t.kind, actor: t.actor, detail: t.detail }));
+  }
+
+  webChoices(): WebChoice[] {
+    return [...this.choices.entries()].map(([id, c]) => ({
+      id,
+      key: c.key,
+      text: c.text,
+      choices: c.options.map((o) => ({ label: o.label, value: o.value, style: o.style })),
+      allowed: [...c.allowed],
+      createdAt: c.at,
+    }));
+  }
+
+  /** The dashboard is this machine's owner: the first person with trust owner. */
+  private webPerson(): string {
+    const owner = Object.entries(this.cfg.people).find(([, p]) => p.trust === 'owner')?.[0];
+    if (!owner) throw new Error('no person with trust: owner in bridge.yaml — the dashboard acts as that person');
+    return owner;
+  }
+
+  webDecide(id: string, value: string): string {
+    const choice = this.choices.get(id);
+    if (!choice) throw new Error('this choice has already been decided or has expired');
+    if (!choice.options.some((o) => o.value === value)) throw new Error(`"${value}" is not one of the options`);
+    const who = this.webPerson();
+    if (!choice.allowed.has(who)) throw new Error(`only ${[...choice.allowed].join(', ')} can decide this`);
+    choice.settle({ by: `${who} (web)`, value });
+    return 'decided';
+  }
+
+  async webWorkspace(key: string, action: 'merge' | 'discard', preview: boolean): Promise<string> {
+    const session = this.store.getSession(key);
+    if (!session) throw new Error('no such conversation');
+    const ws = this.agent(session.agent).workspace;
+    if (!ws) throw new Error(`${session.agent} has no branches (worktree is off)`);
+    if (preview) {
+      if (action === 'merge') {
+        const p = ws.previewMerge(key);
+        if (!p.ok) throw new Error(p.reason);
+        return p.summary;
+      }
+      const lost = ws.previewDiscard(key);
+      if (lost === undefined) throw new Error('this conversation has no branch');
+      return lost ? `This throws away ${lost}` : 'Nothing unmerged — the branch and its worktree are removed.';
+    }
+    const who = this.webPerson();
+    const thread: ThreadRef = { platform: session.platform, channelId: session.channel_id, threadId: session.thread_id, isDM: key.includes(':dm:') };
+    return new Promise<string>((resolve, reject) => {
+      // Behind the conversation's queue, so never in the middle of a turn.
+      this.schedule(key, async () => {
+        try {
+          if (action === 'merge') {
+            const p = ws.previewMerge(key);
+            if (!p.ok) throw new Error(p.reason);
+          }
+          const result = action === 'merge' ? ws.merge(key) : ws.discard(key);
+          this.store.deleteSession(key);
+          this.store.trace(key, action === 'merge' ? 'merged' : 'discarded', `${who} (web)`, { result });
+          await this.send(thread, `${result}
+_(from the dashboard, by ${who})_`).catch(() => {});
+          resolve(result);
+        } catch (err) {
+          reject(err);
+        }
+      });
+    });
+  }
+
+  async webTools(): Promise<WebTool[]> {
+    return Promise.all(
+      Object.entries(this.cfg.tools).map(async ([name, cfg]): Promise<WebTool> => {
+        const base: WebTool = {
+          name,
+          kind: 'url' in cfg ? 'http' : 'stdio',
+          target: 'url' in cfg ? cfg.url : [cfg.command, ...cfg.args].join(' '),
+          oauth: this.oauth.status(name),
+        };
+        if (base.oauth === 'signed-out') return base;
+        try {
+          const list = await Promise.race([
+            this.tools.listTools(name),
+            new Promise<never>((_, rej) => setTimeout(() => rej(new Error('no answer in 10s')), 10e3).unref()),
+          ]);
+          return { ...base, tools: list.length };
+        } catch (err) {
+          return { ...base, error: (err as Error).message };
+        }
+      }),
+    );
+  }
+
   // ───────────────────────── helpers ─────────────────────────
 
   private agent(name: string): AgentAdapter {
@@ -718,7 +863,7 @@ export class Bridge implements HubBackend {
         if (!list.length) this.waiters.delete(opts.key);
         resolve(r);
       };
-      this.choices.set(id, { allowed, settle });
+      this.choices.set(id, { allowed, settle, key: opts.key, text: opts.text, options: opts.choices, at: Date.now() });
       this.waiters.set(opts.key, [...(this.waiters.get(opts.key) ?? []), waiter]);
     });
 

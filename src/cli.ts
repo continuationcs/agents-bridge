@@ -16,6 +16,9 @@ import { TelegramAdapter } from './adapters/im/telegram.ts';
 import { FeishuAdapter } from './adapters/im/feishu.ts';
 import type { ImAdapter } from './adapters/im/types.ts';
 import { ToolHub } from './mcp/tools.ts';
+import { keychainStorage, OAuthFlows } from './mcp/oauth.ts';
+import { localBaseUrl } from './web/api.ts';
+import { createServer } from 'node:http';
 import { resolveSecret, setSecret } from './secrets.ts';
 import { TEMPLATE } from './template.ts';
 import { slackManifest } from './slack-manifest.ts';
@@ -40,6 +43,9 @@ Usage: agents-bridge <command> [options]
                            run the bridge in the background via launchd (macOS)
   worktrees                list conversation branches (claude-code agents with worktree: true)
   worktrees prune          remove idle worktrees with nothing unmerged  [--older-than 7d] [--force]
+  auth [<server>]          sign in to an OAuth tool server in the browser (no name: list them)
+                             [--sign-out]
+  dashboard                open the local web dashboard (http://127.0.0.1:7377)
   status                   show the running bridge
   sessions                 list recent sessions
   trace [--session <key>]  show the audit trail
@@ -61,6 +67,7 @@ async function main() {
       session: { type: 'string' },
       limit: { type: 'string', short: 'n', default: '50' },
       force: { type: 'boolean', default: false },
+      'sign-out': { type: 'boolean', default: false },
       'older-than': { type: 'string', default: '7d' },
       help: { type: 'boolean', short: 'h' },
     },
@@ -183,6 +190,17 @@ async function main() {
       console.log(`stored secret:${arg}`);
       return;
     }
+    case 'auth': {
+      await auth(load(configPath), sub, values['sign-out']!);
+      return;
+    }
+    case 'dashboard': {
+      const base = localBaseUrl(load(configPath).server);
+      if (!(await reachable(base))) fail('bridge is not running (start it with "agents-bridge up" or "agents-bridge service install")');
+      openBrowser(`${base}/`);
+      console.log(`${base}/`);
+      return;
+    }
     case 'status': {
       const cfg = load(configPath);
       try {
@@ -217,9 +235,10 @@ async function run(configPath: string, ims: (cfg: BridgeConfig) => ImAdapter[], 
   const store = openStore(cfg, configPath);
   const log = opts.quiet ? (l: string) => void (l.startsWith('inbound error') && console.error(l)) : (l: string) => console.log(l);
   const filesDir = join(resolve(configPath, '..', cfg.server.data_dir), 'files');
-  const bridge = new Bridge({ cfg, store, ims: ims(cfg), tools: new ToolHub(cfg.tools), filesDir, log });
+  const bridge = new Bridge({ cfg, store, ims: ims(cfg), filesDir, log });
   const { mcpUrl } = await bridge.start();
   log(`agents-bridge up — MCP hub ${mcpUrl}, ${Object.keys(cfg.agents).length} agents, ${cfg.routes.length} routes`);
+  log(`dashboard: ${localBaseUrl(cfg.server)}/`);
 
   let timer: NodeJS.Timeout | undefined;
   // Watch the directory: editors that replace the file would orphan a file watcher.
@@ -296,7 +315,7 @@ async function doctor(configPath: string) {
       });
     }
   }
-  const hub = new ToolHub(c.tools);
+  const hub = new ToolHub(c.tools, { oauth: { storage: keychainStorage, redirectUrl: `${localBaseUrl(c.server)}/oauth/callback` } });
   for (const name of Object.keys(c.tools)) {
     await check(`tool server ${name}`, async () => `${(await hub.listTools(name)).length} tools`);
   }
@@ -385,3 +404,71 @@ function fail(msg: string): never {
 }
 
 main().catch((err) => fail(err?.stack ?? String(err)));
+
+async function reachable(base: string): Promise<boolean> {
+  try {
+    return (await fetch(`${base}/api/status`, { signal: AbortSignal.timeout(1500) })).ok;
+  } catch {
+    return false;
+  }
+}
+
+function openBrowser(url: string) {
+  try {
+    execFileSync(process.platform === 'darwin' ? 'open' : 'xdg-open', [url], { stdio: 'ignore' });
+  } catch {
+    /* printed anyway */
+  }
+}
+
+/** Sign in to an OAuth tool server: through the running bridge, or a temporary local listener. */
+async function auth(cfg: BridgeConfig, server: string | undefined, signOut: boolean) {
+  const base = localBaseUrl(cfg.server);
+  const flows = new OAuthFlows(() => cfg.tools, keychainStorage, `${base}/oauth/callback`);
+  const oauthServers = Object.keys(cfg.tools).filter((n) => flows.status(n) !== 'not-oauth');
+  if (!server) {
+    if (!oauthServers.length) return void console.log('No tool servers use OAuth (add  oauth: true  to an HTTP tool server).');
+    for (const n of oauthServers) console.log(`${flows.status(n) === 'signed-in' ? '✓' : '✗'} ${n}  ${flows.status(n)}`);
+    return;
+  }
+  if (flows.status(server) === 'not-oauth') fail(`"${server}" is not an OAuth tool server (${oauthServers.length ? `OAuth servers: ${oauthServers.join(', ')}` : 'none configured'})`);
+  if (signOut) {
+    flows.signOut(server);
+    if (await reachable(base)) await fetch(`${base}/api/oauth/sign-out`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ server }) }).catch(() => {});
+    return void console.log(`signed out of ${server}`);
+  }
+
+  const start = `${base}/oauth/start/${encodeURIComponent(server)}`;
+  if (await reachable(base)) {
+    // The running bridge handles the callback; wait for the token to land in the keychain.
+    console.log(`Opening ${start}\nFinish signing in in the browser…`);
+    openBrowser(start);
+    const until = Date.now() + 10 * 60e3;
+    while (Date.now() < until) {
+      await new Promise((r) => setTimeout(r, 1500));
+      if (flows.status(server) === 'signed-in') return void console.log(`✓ signed in to ${server}`);
+    }
+    fail('timed out waiting for the sign-in (10 minutes)');
+  }
+
+  // Bridge not running: serve the callback ourselves on the same address.
+  await new Promise<void>((resolveDone, reject) => {
+    const http = createServer((req, res) => {
+      const url = new URL(req.url ?? '/', base);
+      void flows.handle(req, res, url, (name, err) => {
+        if (err) reject(err);
+        else if (name) resolveDone();
+      }).then((handled) => handled || res.writeHead(404).end());
+    });
+    http.once('error', reject);
+    http.listen(cfg.server.port, new URL(base).hostname, () => {
+      console.log(`Opening ${start}\nFinish signing in in the browser…`);
+      openBrowser(start);
+    });
+    setTimeout(() => reject(new Error('timed out waiting for the sign-in (10 minutes)')), 10 * 60e3).unref();
+  }).then(
+    () => console.log(`✓ signed in to ${server}`),
+    (err) => fail(`sign-in failed: ${(err as Error).message}`),
+  );
+  process.exit(0);
+}
