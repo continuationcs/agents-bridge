@@ -36,8 +36,8 @@ agents:
   claude-code: { type: claude-code, cwd: ~/code/app, permission_mode: acceptEdits }
   data-agent:  { type: webhook, url: http://localhost:8080/agent }
 tools:
-  github: { command: npx, args: ["-y", "@modelcontextprotocol/server-github"], env: { GITHUB_PERSONAL_ACCESS_TOKEN: secret:github_token } }
-  search: { url: https://mcp.example.com/mcp, headers: { Authorization: "Bearer ${secret:search_api_key}" } }
+  github: { url: "https://api.githubcopilot.com/mcp/", headers: { Authorization: "Bearer ${secret:github_token}" } }
+  files:  { command: npx, args: ["-y", "@modelcontextprotocol/server-filesystem", "~/notes"] }
 routes:
   - from: slack:#dev
     when: { mention: claude-code, sender: [alice] }
@@ -118,7 +118,7 @@ node dist/cli.js worktrees prune --older-than 7d    # remove idle ones with noth
 ## Tool servers
 
 - **Local** (`command`, `args`, `env`): the bridge starts the MCP server as a child process and talks stdio.
-- **Remote** (`url`, `headers`): Streamable HTTP, falling back to the older SSE transport (`transport: auto | streamable-http | sse`). A header value can be a whole secret ref (`secret:x`, `env:X`) or contain `${secret:x}` / `${env:X}`, e.g. `"Bearer ${secret:search_api_key}"`. OAuth sign-in flows are not supported yet: use servers that accept an API key or token in a header.
+- **Remote** (`url`, `headers`): Streamable HTTP, falling back to the older SSE transport (`transport: auto | streamable-http | sse`). A header value can be a whole secret ref (`secret:x`, `env:X`) or contain `${secret:x}` / `${env:X}`, e.g. `"Bearer ${secret:github_token}"`. OAuth sign-in flows are not supported yet: use servers that accept an API key or token in a header.
 - A dropped connection or expired remote session is reconnected once per call. `agents-bridge doctor` lists each server's tools.
 
 ## Agent protocols

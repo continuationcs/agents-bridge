@@ -33,10 +33,14 @@ agents:
 
 # External tools (MCP servers) the bridge connects to with its own credentials.
 tools: {}
-  # github:
+  # github:                   # GitHub's hosted MCP server (remote, over HTTP)
+  #   url: https://api.githubcopilot.com/mcp/
+  #   headers:
+  #     Authorization: "Bearer \${secret:github_token}"
+  #     X-MCP-Toolsets: repos,pull_requests,issues
+  # files:                    # or a local MCP server started as a child process (stdio)
   #   command: npx
-  #   args: ["-y", "@modelcontextprotocol/server-github"]
-  #   env: { GITHUB_PERSONAL_ACCESS_TOKEN: secret:github_token }
+  #   args: ["-y", "@modelcontextprotocol/server-filesystem", "~/notes"]
 
 # First match wins; anything unmatched is ignored.
 routes:
