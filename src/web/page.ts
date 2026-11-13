@@ -82,6 +82,14 @@ button:disabled { opacity: .5; cursor: default; }
   background: var(--text); color: var(--bg); padding: 10px 14px; border-radius: 8px; white-space: pre-wrap;
   box-shadow: 0 6px 24px rgba(0,0,0,.2); display: none; z-index: 5; }
 #toast.err { background: var(--danger); color: #fff; }
+#ask { position: fixed; inset: 0; z-index: 6; display: none; align-items: center; justify-content: center; padding: 16px;
+  background: rgba(0,0,0,.35); }
+#ask.open { display: flex; }
+#ask .box { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; width: min(560px, 100%);
+  max-height: 85vh; display: flex; flex-direction: column; box-shadow: 0 12px 40px rgba(0,0,0,.25); }
+#ask h3 { margin: 0; padding: 14px 16px 6px; font-size: 15px; }
+#ask .text { padding: 4px 16px 12px; overflow: auto; white-space: pre-wrap; font-family: var(--mono); font-size: 12.5px; }
+#ask .buttons { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--line); }
 .scroll { max-height: 70vh; overflow: auto; }
 </style>
 </head>
@@ -108,6 +116,10 @@ button:disabled { opacity: .5; cursor: default; }
   </div>
 </main>
 <div id="toast"></div>
+<div id="ask" role="dialog" aria-modal="true" aria-labelledby="ask-title"><div class="box">
+  <h3 id="ask-title"></h3><div class="text" id="ask-text"></div>
+  <div class="buttons"><button id="ask-no">Cancel</button><button id="ask-yes"></button></div>
+</div></div>
 <script>
 (function () {
   var selected = null;
@@ -205,12 +217,36 @@ button:disabled { opacity: .5; cursor: default; }
     });
   }
 
+  // In-page confirmation (native confirm() is blocked in embedded browsers).
+  function ask(title, text, yesLabel, danger) {
+    return new Promise(function (resolve) {
+      var box = $('ask'), yes = $('ask-yes'), no = $('ask-no');
+      $('ask-title').textContent = title;
+      $('ask-text').textContent = text || '';
+      yes.textContent = yesLabel;
+      yes.className = danger ? 'danger' : 'primary';
+      function done(v) {
+        box.className = '';
+        yes.onclick = no.onclick = box.onclick = document.onkeydown = null;
+        resolve(v);
+      }
+      yes.onclick = function () { done(true); };
+      no.onclick = function () { done(false); };
+      box.onclick = function (e) { if (e.target === box) done(false); };
+      document.onkeydown = function (e) { if (e.key === 'Escape') done(false); };
+      box.className = 'open';
+      no.focus();
+    });
+  }
+
   function workspaceAction(key, action) {
     api('/api/sessions/' + action, { key: key, preview: true })
       .then(function (r) {
         var verb = action === 'merge' ? 'Merge' : 'Discard';
-        if (!confirm(verb + ' this conversation\'s branch?\n\n' + r.text)) return;
-        return api('/api/sessions/' + action, { key: key }).then(function (r2) { toast(r2.text); refresh(); });
+        return ask(verb + ' this conversation\'s branch?', r.text, verb, action === 'discard').then(function (ok) {
+          if (!ok) return;
+          return api('/api/sessions/' + action, { key: key }).then(function (r2) { toast(r2.text); refresh(); });
+        });
       })
       .catch(function (e) { toast(e.message, true); });
   }
@@ -304,9 +340,10 @@ button:disabled { opacity: .5; cursor: default; }
         actions.push(el('button', {
           class: 'danger', text: 'Sign out',
           onclick: function () {
-            if (!confirm('Sign out of ' + t.name + '? Agents lose its tools until you connect again.')) return;
-            api('/api/oauth/sign-out', { server: t.name }).then(function () { toast('Signed out of ' + t.name + '.'); loadTools(); })
-              .catch(function (e) { toast(e.message, true); });
+            ask('Sign out of ' + t.name + '?', 'Agents lose its tools until you connect again.', 'Sign out', true).then(function (ok) {
+              if (!ok) return;
+              return api('/api/oauth/sign-out', { server: t.name }).then(function () { toast('Signed out of ' + t.name + '.'); loadTools(); });
+            }).catch(function (e) { toast(e.message, true); });
           },
         }));
       }
