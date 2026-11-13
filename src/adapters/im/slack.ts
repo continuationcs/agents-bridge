@@ -1,13 +1,17 @@
 import { SocketModeClient } from '@slack/socket-mode';
 import { WebClient } from '@slack/web-api';
 import type { InboundFile, InboundMessage } from '../../core/router.ts';
-import { toSlackMrkdwn } from './slack-format.ts';
+import { toSlackMrkdwn, truncateMrkdwn } from './slack-format.ts';
 import type { Choice, ImAdapter, InboundAction, OutboundMessage } from './types.ts';
+
+/** Section block text is limited to 3000 characters. */
+const SECTION_MAX = 3000;
 
 /**
  * Slack over Socket Mode (outbound WebSocket, no public URL).
  * App needs: connections:write (app token); chat:write, channels:history, groups:history,
- * im:history, channels:read (bot token); events message.channels, message.groups, message.im.
+ * im:history, channels:read, groups:read (private channel names), files:read (attachments)
+ * (bot token); events message.channels, message.groups, message.im.
  */
 export class SlackAdapter implements ImAdapter {
   readonly platform = 'slack';
@@ -42,9 +46,7 @@ export class SlackAdapter implements ImAdapter {
     this.botUserId = String(auth.user_id);
     this.socket.on('message', async ({ event, ack }: { event: any; ack: () => Promise<void> }) => {
       await ack();
-      // file_share is a normal message with attachments; other subtypes are edits, joins, bot posts…
-      const subtypeOk = !event?.subtype || event.subtype === 'file_share';
-      if (!event || !subtypeOk || event.bot_id || !event.user || event.user === this.botUserId) return;
+      if (!isPersonMessage(event, this.botUserId)) return;
       const mentionTag = `<@${this.botUserId}>`;
       const raw = String(event.text ?? '');
       const isDM = event.channel_type === 'im';
@@ -85,7 +87,7 @@ export class SlackAdapter implements ImAdapter {
       thread_ts: msg.isDM ? undefined : msg.threadId,
       text,
       blocks: [
-        { type: 'section', text: { type: 'mrkdwn', text: text.slice(0, 3000) } },
+        { type: 'section', text: { type: 'mrkdwn', text: truncateMrkdwn(text, SECTION_MAX) } },
         {
           type: 'actions',
           elements: choices.map((c, i) => ({
@@ -108,7 +110,7 @@ export class SlackAdapter implements ImAdapter {
       ts: messageId,
       text: `${body}\n${outcome}`,
       blocks: [
-        { type: 'section', text: { type: 'mrkdwn', text: body.slice(0, 3000) } },
+        { type: 'section', text: { type: 'mrkdwn', text: truncateMrkdwn(body, SECTION_MAX) } },
         { type: 'context', elements: [{ type: 'mrkdwn', text: toSlackMrkdwn(outcome) }] },
       ],
     });
@@ -154,4 +156,14 @@ export class SlackAdapter implements ImAdapter {
       return id;
     }
   }
+}
+
+/**
+ * A message a person wrote: plain, with attachments (file_share), or a thread reply also sent to the
+ * channel (thread_broadcast). Other subtypes are edits, deletions, joins, bot posts…
+ */
+export function isPersonMessage(event: any, botUserId: string): boolean {
+  if (!event) return false;
+  const subtypeOk = !event.subtype || event.subtype === 'file_share' || event.subtype === 'thread_broadcast';
+  return subtypeOk && !event.bot_id && !!event.user && event.user !== botUserId;
 }

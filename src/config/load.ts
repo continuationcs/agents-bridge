@@ -48,12 +48,12 @@ export function semanticCheck(cfg: BridgeConfig): string[] {
     if (from.kind === 'im') {
       if (targets.length !== 1) issues.push(`${where}: a route from IM must go to exactly one agent`);
       const target = targets[0]!;
-      const agent = cfg.agents[target];
+      const agent = Object.hasOwn(cfg.agents, target) ? cfg.agents[target] : undefined;
       if (!agent) {
         issues.push(`${where}: unknown agent "${target}"`);
         return;
       }
-      if (from.platform !== 'local' && !(from.platform in cfg.im)) {
+      if (from.platform !== 'local' && !Object.hasOwn(cfg.im, from.platform)) {
         issues.push(`${where}: IM "${from.platform}" is not configured under im:`);
       }
       // Agents running on this machine are only reachable by people named in the route.
@@ -64,6 +64,10 @@ export function semanticCheck(cfg: BridgeConfig): string[] {
       }
       if (typeof route.when.mention === 'string' && route.when.mention !== target) {
         issues.push(`${where}: when.mention "${route.when.mention}" should name the route's agent "${target}"`);
+      }
+      const { mention, listen } = route.when;
+      if ((listen === 'all' && mention !== undefined && mention !== false) || (listen === 'mention' && mention === false)) {
+        issues.push(`${where}: when.listen "${listen}" contradicts when.mention ${JSON.stringify(mention)}`);
       }
     } else {
       if (!agentNames.has(from.name)) issues.push(`${where}: from "${route.from}" is not an agent`);
@@ -84,10 +88,15 @@ export function semanticCheck(cfg: BridgeConfig): string[] {
   });
 
   cfg.policies.forEach((p, i) => {
+    const where = `policies[${i}]`;
     for (const who of p.approve_by ?? []) {
-      if (who !== 'initiator' && !people.has(who)) {
-        issues.push(`policies[${i}]: approve_by "${who}" is neither "initiator" nor a person`);
-      }
+      if (who === 'initiator') continue;
+      if (!people.has(who)) issues.push(`${where}: approve_by "${who}" is neither "initiator" nor a person`);
+      else if (cfg.people[who]!.trust === 'external') issues.push(`${where}: approve_by "${who}" has trust external and can't approve`);
+    }
+    // Hop limits and budgets belong to an agent (and its conversation), not to a single tool call.
+    if ((p.max_hops !== undefined || p.budget_usd !== undefined) && (p.match.tool !== undefined || p.match.writes !== undefined)) {
+      issues.push(`${where}: max_hops / budget_usd apply per agent — match them by agent only, not by tool or writes`);
     }
   });
 

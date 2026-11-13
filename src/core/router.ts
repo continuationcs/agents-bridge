@@ -83,10 +83,16 @@ export class Router {
         trace.push(`${label}: message addresses "${addressed}"`);
         continue;
       }
+      // A reply in a thread the agent already holds continues it without a fresh mention or address.
       const continuing = ctx.threadAgent === agent;
-      const needsMention = !msg.isDM && route.when.listen !== 'all';
-      if (needsMention && !msg.mentioned && !continuing) {
+      const { mention, listen } = route.when;
+      const needsMention = mention === undefined ? listen !== 'all' : mention !== false;
+      if (needsMention && !(msg.isDM || msg.mentioned) && !continuing) {
         trace.push(`${label}: bot not mentioned`);
+        continue;
+      }
+      if (typeof mention === 'string' && addressed !== mention && !continuing) {
+        trace.push(`${label}: message does not address "${mention}" (start it with "${mention}")`);
         continue;
       }
       const sender = route.when.sender;
@@ -120,9 +126,9 @@ export class Router {
 
   private leadingAgent(text: string): { agent?: string; rest: string } {
     const m = /^\s*@?([A-Za-z0-9][\w-]*)[\s,:，：]+([\s\S]*)$/.exec(text);
-    if (m && m[1]! in this.cfg.agents) return { agent: m[1]!, rest: m[2]! };
+    if (m && Object.hasOwn(this.cfg.agents, m[1]!)) return { agent: m[1]!, rest: m[2]! };
     const bare = text.trim().replace(/^@/, '');
-    if (bare in this.cfg.agents) return { agent: bare, rest: '' };
+    if (Object.hasOwn(this.cfg.agents, bare)) return { agent: bare, rest: '' };
     return { rest: text };
   }
 }

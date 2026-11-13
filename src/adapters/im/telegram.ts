@@ -1,34 +1,65 @@
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 import type { InboundMessage } from '../../core/router.ts';
 import type { ImAdapter, OutboundMessage } from './types.ts';
+
+/** How many message → thread-root entries are kept (and persisted): recent threads, a small file. */
+const MAX_ROOTS = 5000;
+/** Any call but the long poll. */
+const CALL_TIMEOUT_MS = 60_000;
+
+interface TelegramState {
+  /** The next update id to fetch: everything below it was handed to the bridge. */
+  offset: number;
+  /** "chatId:messageId" → thread root message id, oldest first. */
+  roots: [string, string][];
+}
 
 /**
  * Telegram via Bot API long polling (no public URL). In groups, turn off privacy mode in
  * @BotFather if routes use `listen: all`; otherwise the bot only sees mentions and replies.
  * A reply chain to one root message is one thread.
+ *
+ * With `stateFile`, the update offset and the reply-chain map survive restarts, so the last batch
+ * isn't delivered twice and threads don't split. Without it the offset is still confirmed to
+ * Telegram on stop().
  */
 export class TelegramAdapter implements ImAdapter {
   readonly platform = 'telegram';
   readonly maxTextLength = 4000;
   private readonly api: string;
+  private readonly stateFile?: string;
   private username = '';
   private botId = 0;
   private offset = 0;
-  private readonly abort = new AbortController();
+  /** Cancels only the long poll; sends and edits in flight finish on their own. */
+  private readonly polling = new AbortController();
+  private pollLoop?: Promise<void>;
   private readonly rootOf = new Map<string, string>();
 
-  constructor(opts: { botToken: string; apiBase?: string }) {
+  constructor(opts: { botToken: string; apiBase?: string; stateFile?: string }) {
     this.api = `${opts.apiBase ?? 'https://api.telegram.org'}/bot${opts.botToken}`;
+    this.stateFile = opts.stateFile;
+    this.load();
   }
 
   async start(onMessage: (msg: InboundMessage) => void) {
     const me = await this.call<{ id: number; username: string }>('getMe', {});
     this.botId = me.id;
     this.username = me.username;
-    void this.poll(onMessage);
+    this.pollLoop = this.poll(onMessage);
   }
 
   async stop() {
-    this.abort.abort();
+    this.polling.abort();
+    await this.pollLoop;
+    // Confirm what was handed over, so Telegram doesn't deliver it again after a restart.
+    if (this.offset) {
+      await this.call('getUpdates', { offset: this.offset, timeout: 0, limit: 1, allowed_updates: ['message'] }, AbortSignal.timeout(10_000)).catch(
+        (err) => console.error(`telegram: confirming updates failed: ${(err as Error).message}`),
+      );
+    }
+    this.save();
   }
 
   async send(msg: OutboundMessage): Promise<string> {
@@ -39,6 +70,7 @@ export class TelegramAdapter implements ImAdapter {
     });
     const id = String(sent.message_id);
     this.remember(msg.channelId, id, msg.threadId);
+    this.save();
     return id;
   }
 
@@ -47,13 +79,14 @@ export class TelegramAdapter implements ImAdapter {
   }
 
   private async poll(onMessage: (msg: InboundMessage) => void) {
-    while (!this.abort.signal.aborted) {
+    const signal = this.polling.signal;
+    while (!signal.aborted) {
       try {
-        const updates = await this.call<any[]>('getUpdates', {
-          offset: this.offset,
-          timeout: 30,
-          allowed_updates: ['message'],
-        });
+        const updates = await this.call<any[]>(
+          'getUpdates',
+          { offset: this.offset, timeout: 30, allowed_updates: ['message'] },
+          AbortSignal.any([signal, AbortSignal.timeout(30_000 + CALL_TIMEOUT_MS)]),
+        );
         for (const u of updates) {
           this.offset = u.update_id + 1;
           const m = u.message;
@@ -61,10 +94,14 @@ export class TelegramAdapter implements ImAdapter {
           const parsed = this.parse(m);
           if (parsed) onMessage(parsed);
         }
+        if (updates.length) this.save();
       } catch (err) {
-        if (this.abort.signal.aborted) return;
+        if (signal.aborted) return;
         console.error(`telegram poll: ${(err as Error).message}`);
-        await new Promise((r) => setTimeout(r, 3000));
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, 3000);
+          signal.addEventListener('abort', () => (clearTimeout(timer), resolve()), { once: true });
+        });
       }
     }
   }
@@ -96,15 +133,40 @@ export class TelegramAdapter implements ImAdapter {
 
   private remember(chatId: string, messageId: string, root: string) {
     this.rootOf.set(`${chatId}:${messageId}`, root);
-    if (this.rootOf.size > 20000) this.rootOf.delete(this.rootOf.keys().next().value!);
+    if (this.rootOf.size > MAX_ROOTS) this.rootOf.delete(this.rootOf.keys().next().value!);
   }
 
-  private async call<T>(method: string, body: unknown): Promise<T> {
+  private load() {
+    if (!this.stateFile || !existsSync(this.stateFile)) return;
+    try {
+      const state = JSON.parse(readFileSync(this.stateFile, 'utf8')) as Partial<TelegramState>;
+      if (typeof state.offset === 'number') this.offset = state.offset;
+      for (const [k, v] of state.roots ?? []) if (typeof k === 'string' && typeof v === 'string') this.rootOf.set(k, v);
+    } catch (err) {
+      console.error(`telegram: ignoring unreadable ${this.stateFile}: ${(err as Error).message}`);
+    }
+  }
+
+  /** Atomic write (temp file + rename), so a crash mid-write leaves the previous state. */
+  private save() {
+    if (!this.stateFile) return;
+    const state: TelegramState = { offset: this.offset, roots: [...this.rootOf] };
+    try {
+      mkdirSync(dirname(this.stateFile), { recursive: true });
+      const tmp = `${this.stateFile}.tmp`;
+      writeFileSync(tmp, JSON.stringify(state), { mode: 0o600 });
+      renameSync(tmp, this.stateFile);
+    } catch (err) {
+      console.error(`telegram: saving ${this.stateFile} failed: ${(err as Error).message}`);
+    }
+  }
+
+  private async call<T>(method: string, body: unknown, signal?: AbortSignal): Promise<T> {
     const res = await fetch(`${this.api}/${method}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),
-      signal: this.abort.signal,
+      signal: signal ?? AbortSignal.timeout(CALL_TIMEOUT_MS),
     });
     const json = (await res.json()) as { ok: boolean; result: T; description?: string };
     if (!json.ok) throw new Error(`${method}: ${json.description ?? res.status}`);

@@ -1,24 +1,24 @@
 {
-  "name": "agents-bridge",
+  "name": "bridge",
   "version": "0.1.0",
-  "description": "Connect agents to IM, to other agents, and to tools — one local process, one bridge.yaml.",
+  "description": "Connect agents to IM, to other agents, and to tools \u2014 one local process, one bridge.yaml.",
   "type": "module",
   "license": "MIT",
   "bin": {
-    "agents-bridge": "dist/cli.js"
+    "bridge": "out/cli.js"
   },
   "files": [
-    "dist",
-    "examples"
+    "out",
+    "src/examples"
   ],
   "engines": {
     "node": ">=24"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.build.json",
     "dev": "node src/cli.ts",
-    "test": "node --test 'test/**/*.test.ts'",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "test": "node --test 'src/test/**/*.test.ts'",
+    "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.76.0",

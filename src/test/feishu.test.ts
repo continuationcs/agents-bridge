@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { FeishuAdapter, card } from '../src/adapters/im/feishu.ts';
-import { toFeishuMarkdown } from '../src/adapters/im/feishu-format.ts';
+import { FeishuAdapter, card } from '../adapters/im/feishu.ts';
+import { toFeishuMarkdown } from '../adapters/im/feishu-format.ts';
 
 function adapter() {
   const a = new FeishuAdapter({ appId: 'cli_test', appSecret: 'x' }) as any;
@@ -77,4 +77,29 @@ test('feishu markdown: tables become records, code untouched', () => {
     toFeishuMarkdown('| 文件 | 作用 |\n|---|---|\n| `a.ts` | 路由<br>匹配 |\n\n```\n| not | a table |\n```'),
     '**a.ts**\n- 作用: \n    - 路由\n    - 匹配\n\n```\n| not | a table |\n```',
   );
+});
+
+test('mentions: @_user_1 never corrupts @_user_10…; post `at` elements carry the placeholder key', async () => {
+  const mentions = [
+    { key: '@_user_1', id: { open_id: 'ou_bot' }, name: 'bridge' },
+    ...Array.from({ length: 11 }, (_, i) => ({ key: `@_user_${i + 2}`, id: { open_id: `ou_${i + 2}` }, name: `P${i + 2}` })),
+  ];
+  const msg = await adapter().parse(event({ message_type: 'text', content: JSON.stringify({ text: '@_user_1 cc @_user_12 and @_user_2' }), mentions }));
+  assert.equal(msg.text, 'cc @P12 and @P2');
+  assert.equal(msg.mentioned, true);
+
+  const post = await adapter().parse(
+    event({
+      message_type: 'post',
+      mentions: [
+        { key: '@_user_1', id: { open_id: 'ou_bot' }, name: 'bridge' },
+        { key: '@_user_2', id: { open_id: 'ou_bob' }, name: 'Bob' },
+      ],
+      content: JSON.stringify({
+        content: [[{ tag: 'at', user_id: '@_user_1', user_name: 'bridge' }, { tag: 'text', text: ' ask ' }, { tag: 'at', user_id: '@_user_2', user_name: 'Bob' }]],
+      }),
+    }),
+  );
+  assert.equal(post.text, 'ask @Bob');
+  assert.equal(post.mentioned, true);
 });

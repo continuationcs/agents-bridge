@@ -2,7 +2,7 @@ import { createInterface, type Interface } from 'node:readline';
 import type { InboundMessage } from '../../core/router.ts';
 import type { ImAdapter, OutboundMessage } from './types.ts';
 
-/** `agents-bridge chat`: the terminal acts as a DM, so routes from `local:*` can be tried without any IM. */
+/** `bridge chat`: the terminal acts as a DM, so routes from `local:*` can be tried without any IM. */
 export class LocalConsoleAdapter implements ImAdapter {
   readonly platform = 'local';
   readonly maxTextLength = 100_000;

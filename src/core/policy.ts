@@ -7,7 +7,11 @@ export interface ApprovalRule {
   policy: Policy;
 }
 
-/** Evaluates `policies:`. Every matching policy applies; the strictest value wins. */
+/**
+ * Evaluates `policies:`. A policy applies when every key in its `match` holds (a missing key matches anything);
+ * every applying policy counts and the strictest value wins. `max_hops` / `budget_usd` are per agent, so
+ * semanticCheck only allows them on policies that match by `agent` alone.
+ */
 export class PolicyEngine {
   private readonly cfg: BridgeConfig;
   constructor(cfg: BridgeConfig) {
@@ -28,10 +32,17 @@ export class PolicyEngine {
     return b.length ? Math.min(...b) : undefined;
   }
 
-  /** Approval needed before `tool` (as "server.tool") runs? Approvers are merged across matching policies. */
-  approvalFor(tool: string, opts: { readOnly?: boolean } = {}): ApprovalRule | undefined {
+  /**
+   * Approval needed before `agent` runs `tool` (as "server.tool")? Approvers are merged across matching
+   * policies, the shortest timeout wins.
+   */
+  approvalFor(agent: string, tool: string, opts: { readOnly?: boolean } = {}): ApprovalRule | undefined {
     const hits = this.cfg.policies.filter(
-      (p) => p.approve_by?.length && anyGlob(p.match.tool, tool) && !(p.match.writes && opts.readOnly),
+      (p) =>
+        p.approve_by?.length &&
+        (p.match.agent === undefined || anyGlob(p.match.agent, agent)) &&
+        (p.match.tool === undefined || anyGlob(p.match.tool, tool)) &&
+        !(p.match.writes && opts.readOnly),
     );
     if (!hits.length) return undefined;
     const approvers = [...new Set(hits.flatMap((p) => p.approve_by ?? []))];
@@ -40,6 +51,8 @@ export class PolicyEngine {
   }
 
   private forAgent(agent: string): Policy[] {
-    return this.cfg.policies.filter((p) => anyGlob(p.match.agent, agent));
+    return this.cfg.policies.filter(
+      (p) => p.match.tool === undefined && p.match.writes === undefined && (p.match.agent === undefined || anyGlob(p.match.agent, agent)),
+    );
   }
 }

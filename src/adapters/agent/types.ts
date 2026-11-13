@@ -27,24 +27,31 @@ export interface AgentReply {
   costUsd?: number;
 }
 
-/** Where an agent's work lives between turns (a git branch), for the in-thread status/merge/discard commands. */
+/**
+ * Where an agent's work lives between turns (a git branch), for the in-thread status/merge/discard commands.
+ * Every method runs git (possibly over the network for PRs), so all of them are async.
+ */
 export interface Workspace {
   /** Human-readable status, or undefined when this conversation has no workspace yet. */
-  status(sessionKey: string): string | undefined;
+  status(sessionKey: string): Promise<string | undefined>;
   /** What merging would do, or why it can't happen now. */
-  previewMerge(sessionKey: string): { ok: true; summary: string } | { ok: false; reason: string };
-  merge(sessionKey: string): string;
-  /** What discarding would throw away ('' when there is nothing to lose). */
-  previewDiscard(sessionKey: string): string | undefined;
-  discard(sessionKey: string): string;
+  previewMerge(sessionKey: string): Promise<{ ok: true; summary: string } | { ok: false; reason: string }>;
+  merge(sessionKey: string): Promise<string>;
   /**
-   * Remove worktrees whose conversation is idle and that hold nothing unmerged.
-   * `isIdle(slug)` decides (slug = sessionSlug(key)); returns the branches removed.
+   * What discarding would throw away: '' when there is nothing to lose, undefined when there is no
+   * branch. Anything else (including "can't tell") must be confirmed before discarding.
    */
-  prune?(isIdle: (slug: string) => boolean): string[];
+  previewDiscard(sessionKey: string): Promise<string | undefined>;
+  discard(sessionKey: string): Promise<string>;
+  /**
+   * Remove worktrees whose conversation is idle and that are known to hold nothing unmerged.
+   * `isIdle(slug)` decides (slug = sessionSlug(key)). A worktree that fails is listed in `errors`
+   * and doesn't stop the others.
+   */
+  prune?(isIdle: (slug: string) => boolean): Promise<{ removed: string[]; errors: string[] }>;
   /** Push the branch and open a pull request; absent when no git token is configured. */
-  previewPr?(sessionKey: string): { ok: true; summary: string } | { ok: false; reason: string };
-  pr?(sessionKey: string): string;
+  previewPr?(sessionKey: string): Promise<{ ok: true; summary: string } | { ok: false; reason: string }>;
+  pr?(sessionKey: string): Promise<string>;
 }
 
 export interface AgentAdapter {

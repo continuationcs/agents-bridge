@@ -4,7 +4,7 @@
     "module": "nodenext",
     "moduleResolution": "nodenext",
     "rootDir": "src",
-    "outDir": "dist",
+    "outDir": "out",
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "erasableSyntaxOnly": true,
@@ -14,7 +14,12 @@
     "skipLibCheck": true,
     "declaration": false,
     "sourceMap": true,
-    "types": ["node"]
+    "types": [
+      "node"
+    ],
+    "noEmit": true
   },
-  "include": ["src"]
+  "include": [
+    "src"
+  ]
 }

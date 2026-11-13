@@ -5,9 +5,9 @@ import type { AddressInfo } from 'node:net';
 import { test } from 'node:test';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { parseConfig } from '../src/config/load.ts';
-import { memoryStorage, OAuthFlows } from '../src/mcp/oauth.ts';
-import { ToolHub } from '../src/mcp/tools.ts';
+import { parseConfig } from '../config/load.ts';
+import { memoryStorage, OAuthFlows } from '../mcp/oauth.ts';
+import { ToolHub } from '../mcp/tools.ts';
 
 /** A remote MCP server behind its own OAuth authorization server (discovery, DCR, PKCE, refresh). */
 async function oauthServer() {
@@ -111,7 +111,7 @@ tools:
   });
   try {
     assert.equal(flows.status('remote'), 'signed-out');
-    await assert.rejects(hub.listTools('remote'), /not signed in to "remote" — run: agents-bridge auth remote/);
+    await assert.rejects(hub.listTools('remote'), /not signed in to "remote" — run: bridge auth remote/);
 
     // Browser: start → provider's /authorize → back to our callback with code + state.
     const authorize = await flows.start('remote');
@@ -123,7 +123,10 @@ tools:
     assert.equal(await flows.finish(callback.searchParams), 'remote');
     assert.deepEqual(signedIn, ['remote']);
     assert.equal(flows.status('remote'), 'signed-in');
-    assert.equal(storage.get('remote').verifier, undefined);
+
+    // A second sign-in that is abandoned leaves the working grant alone.
+    await flows.start('remote');
+    assert.equal(storage.get('remote').tokens?.access_token, 'a1');
 
     const r1 = (await hub.callTool('remote', 'whoami', {})) as any;
     assert.equal(r1.content[0].text, 'token a1');

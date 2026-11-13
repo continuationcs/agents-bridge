@@ -19,7 +19,6 @@ export interface ToolResult {
 export interface HubBackend {
   listTools(grant: SessionGrant): Promise<Tool[]>;
   callTool(grant: SessionGrant, name: string, args: Record<string, unknown>): Promise<ToolResult>;
-  status(): unknown;
   /** Other local routes (dashboard, OAuth); return false to fall through. */
   handleHttp?(req: IncomingMessage, res: import('node:http').ServerResponse, url: URL): Promise<boolean>;
 }
@@ -67,11 +66,6 @@ export class McpHub {
 
   private async handle(req: IncomingMessage, res: import('node:http').ServerResponse) {
     const url = new URL(req.url ?? '/', 'http://x');
-    if (url.pathname === '/api/status' && req.method === 'GET') {
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify(this.backend.status()));
-      return;
-    }
     if (!url.pathname.startsWith('/mcp/') && this.backend.handleHttp && (await this.backend.handleHttp(req, res, url))) return;
     const m = /^\/mcp\/([A-Za-z0-9_-]+)$/.exec(url.pathname);
     const grant = m ? this.grants.get(m[1]!) : undefined;
@@ -82,7 +76,7 @@ export class McpHub {
     const body = req.method === 'POST' ? await readJson(req) : undefined;
 
     // Stateless: a fresh MCP server per request, bound to this grant.
-    const server = new Server({ name: 'agents-bridge', version: '0.1.0' }, { capabilities: { tools: {} } });
+    const server = new Server({ name: 'bridge', version: '0.1.0' }, { capabilities: { tools: {} } });
     server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: await this.backend.listTools(grant) }));
     server.setRequestHandler(CallToolRequestSchema, async (r) => {
       try {

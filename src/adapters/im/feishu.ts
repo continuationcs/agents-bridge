@@ -108,9 +108,13 @@ export class FeishuAdapter implements ImAdapter {
 
     const mentions: any[] = m.mentions ?? [];
     const mentioned = mentions.some((x) => x?.id?.open_id === this.botOpenId);
-    // "@_user_1" placeholders: drop the bot's, spell out everyone else's.
-    const unmention = (s: string) =>
-      mentions.reduce((acc, x) => acc.split(x.key).join(x?.id?.open_id === this.botOpenId ? '' : `@${x.name}`), s).trim();
+    // "@_user_1" placeholders: drop the bot's, spell out everyone else's. One pass with the longest keys
+    // first, so @_user_1 never eats the start of @_user_12.
+    const byKey = new Map<string, any>(mentions.filter((x) => typeof x?.key === 'string' && x.key).map((x) => [x.key, x]));
+    const keys = [...byKey.keys()].sort((a, b) => b.length - a.length).map((k) => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    const keyPattern = keys.length ? new RegExp(keys.join('|'), 'g') : undefined;
+    const spell = (x: any) => (x?.id?.open_id === this.botOpenId ? '' : `@${x?.name ?? ''}`);
+    const unmention = (s: string) => (keyPattern ? s.replace(keyPattern, (k) => spell(byKey.get(k))) : s).trim();
 
     let content: any = {};
     try {
@@ -133,7 +137,12 @@ export class FeishuAdapter implements ImAdapter {
               .map((el) => {
                 if (el.tag === 'text' || el.tag === 'code_block') return el.text ?? '';
                 if (el.tag === 'a') return el.href ? `[${el.text ?? el.href}](${el.href})` : el.text ?? '';
-                if (el.tag === 'at') return el.user_id === this.botOpenId ? '' : `@${el.user_name ?? ''}`;
+                // In received posts user_id is the "@_user_N" key of `mentions`; an open_id also occurs.
+                if (el.tag === 'at') {
+                  const m = byKey.get(el.user_id);
+                  if (m) return spell(m);
+                  return el.user_id === this.botOpenId ? '' : `@${el.user_name ?? ''}`;
+                }
                 if (el.tag === 'img' && el.image_key) files.push(this.file(m.message_id, el.image_key, 'image', `${el.image_key}.png`));
                 return '';
               })

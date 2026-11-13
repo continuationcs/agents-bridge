@@ -19,16 +19,16 @@ import { ToolHub } from './mcp/tools.ts';
 import { keychainStorage, OAuthFlows } from './mcp/oauth.ts';
 import { localBaseUrl } from './web/api.ts';
 import { createServer } from 'node:http';
-import { resolveSecret, setSecret } from './secrets.ts';
+import { envRefs, keychainRead, resolveSecret, setSecret } from './secrets.ts';
 import { TEMPLATE } from './template.ts';
 import { slackManifest } from './slack-manifest.ts';
 import { expandHome, listWorktrees, removeAt, sessionSlug, statusAt } from './adapters/agent/worktree.ts';
 import { parseDuration } from './core/address.ts';
 import { installService, restartService, serviceStatus, uninstallService } from './service.ts';
 
-const HELP = `agents-bridge — connect agents to IM, to each other, and to tools
+const HELP = `bridge — connect agents to IM, to each other, and to tools
 
-Usage: agents-bridge <command> [options]
+Usage: bridge <command> [options]
 
   init                     write a starter bridge.yaml
   up                       connect IMs and start routing
@@ -81,11 +81,11 @@ async function main() {
     case 'init': {
       if (existsSync(configPath) && !values.force) fail(`${configPath} exists (use --force to overwrite)`);
       writeFileSync(configPath, TEMPLATE);
-      console.log(`wrote ${configPath}\nnext: edit it, then run "agents-bridge doctor" and "agents-bridge chat --as me"`);
+      console.log(`wrote ${configPath}\nnext: edit it, then run "bridge doctor" and "bridge chat --as me"`);
       return;
     }
     case 'up':
-      return run(configPath, (cfg) => buildIms(cfg));
+      return run(configPath, (cfg) => buildIms(cfg, resolve(configPath, '..', cfg.server.data_dir)));
     case 'chat': {
       if (!values.as) fail('chat needs --as <person id from people:>');
       return run(configPath, () => [new LocalConsoleAdapter({ as: values.as! })], { quiet: true });
@@ -93,7 +93,7 @@ async function main() {
     case 'doctor':
       return doctor(configPath);
     case 'routes': {
-      if (sub !== 'explain') fail('usage: agents-bridge routes explain --from <im:channel> --sender <person>');
+      if (sub !== 'explain') fail('usage: bridge routes explain --from <im:channel> --sender <person>');
       const cfg = load(configPath);
       const from = values.from ?? fail('--from is required, e.g. --from slack:#dev');
       const i = from.indexOf(':');
@@ -119,10 +119,10 @@ async function main() {
       return;
     }
     case 'service': {
-      load(configPath); // refuse to install a service with a broken config
       // launchd opens the log itself, and it can't write into TCC-protected folders like ~/Documents.
-      const logFile = join(homedir(), 'Library', 'Logs', 'agents-bridge', 'bridge.log');
+      const logFile = join(homedir(), 'Library', 'Logs', 'bridge', 'bridge.log');
       if (sub === 'install') {
+        checkServiceSecrets(load(configPath)); // refuse a config the service couldn't start with
         const plist = installService({ configPath, logFile });
         console.log(`installed ${plist}\nlogs: ${logFile}`);
       } else if (sub === 'uninstall') {
@@ -133,7 +133,7 @@ async function main() {
         console.log('restarted');
       } else if (sub === 'status') {
         console.log(JSON.stringify(serviceStatus(), null, 2));
-      } else fail('usage: agents-bridge service install|uninstall|restart|status');
+      } else fail('usage: bridge service install|uninstall|restart|status');
       return;
     }
     case 'worktrees': {
@@ -141,50 +141,57 @@ async function main() {
       const store = openStore(cfg, configPath);
       const sessions = new Map(store.listSessions(10_000).map((s) => [sessionSlug(s.key), s]));
       const prune = sub === 'prune';
-      if (sub && !prune) fail('usage: agents-bridge worktrees [prune [--older-than 7d] [--force]]');
+      if (sub && !prune) fail('usage: bridge worktrees [prune [--older-than 7d] [--force]]');
       const cutoff = Date.now() - parseDuration(values['older-than']!);
       let count = 0;
       for (const [name, agent] of Object.entries(cfg.agents)) {
         if (agent.type !== 'claude-code' || !agent.worktree) continue;
-        for (const wt of listWorktrees(expandHome(agent.cwd ?? process.cwd()))) {
-          const st = statusAt(wt.root, wt.path, wt.branch, agent.worktree_links);
+        for (const wt of await listWorktrees(expandHome(agent.cwd ?? process.cwd()))) {
           const session = sessions.get(wt.branch.replace(/^bridge\//, ''));
           const last = session?.last_active;
-          const unmerged = (st?.commits.length ?? 0) + (st?.dirty.length ?? 0);
-          if (prune) {
-            if (last && last > cutoff) continue;
-            if (unmerged && !values.force) {
-              console.log(`kept    ${wt.branch}  (${st?.commits.length ?? 0} unmerged commits, ${st?.dirty.length ?? 0} uncommitted files; --force to remove)`);
+          if (prune && last && last > cutoff) continue;
+          try {
+            const st = await statusAt(wt.root, wt.path, wt.branch, agent.worktree_links);
+            // Unknown (base branch gone, git failing) counts as unmerged.
+            const commits = st ? (st.commits ? String(st.commits.length) : 'unknown') : '0';
+            const unmerged = !!st && (!st.commits || st.commits.length > 0 || st.dirty.length > 0);
+            if (prune) {
+              if (unmerged && !values.force) {
+                console.log(`kept    ${wt.branch}  (${commits} unmerged commits, ${st?.dirty.length ?? 0} uncommitted files; --force to remove)`);
+                continue;
+              }
+              await removeAt(wt.root, wt.path, wt.branch);
+              if (session) store.deleteSession(session.key);
+              console.log(`removed ${wt.branch}`);
+              count++;
               continue;
             }
-            removeAt(wt.root, wt.path, wt.branch);
-            if (session) store.deleteSession(session.key);
-            console.log(`removed ${wt.branch}`);
             count++;
-            continue;
+            console.log(
+              `${wt.branch}  [${name}]  base ${st?.base ?? '?'}  ${commits} commits  ${st?.dirty.length ?? 0} uncommitted  ` +
+                `last active ${last ? new Date(last).toISOString() : 'unknown'}\n  ${wt.path}${session ? `\n  session ${session.key}` : ''}` +
+                (st?.note ? `\n  note: ${st.note}` : ''),
+            );
+          } catch (err) {
+            console.log(`error   ${wt.branch}  ${(err as Error).message}`);
           }
-          count++;
-          console.log(
-            `${wt.branch}  [${name}]  base ${st?.base ?? '?'}  ${st?.commits.length ?? 0} commits  ${st?.dirty.length ?? 0} uncommitted  ` +
-              `last active ${last ? new Date(last).toISOString() : 'unknown'}\n  ${wt.path}${session ? `\n  session ${session.key}` : ''}`,
-          );
         }
       }
       if (!count) console.log(prune ? 'nothing to prune' : 'no conversation worktrees');
       return;
     }
     case 'feishu': {
-      if (sub !== 'setup') fail('usage: agents-bridge feishu setup');
+      if (sub !== 'setup') fail('usage: bridge feishu setup');
       process.stdout.write(FEISHU_SETUP);
       return;
     }
     case 'slack': {
-      if (sub !== 'manifest') fail('usage: agents-bridge slack manifest [app name]');
+      if (sub !== 'manifest') fail('usage: bridge slack manifest [app name]');
       process.stdout.write(slackManifest(arg));
       return;
     }
     case 'secret': {
-      if (sub !== 'set' || !arg) fail('usage: agents-bridge secret set <name>');
+      if (sub !== 'set' || !arg) fail('usage: bridge secret set <name>');
       const value = await readSecretValue(`value for ${arg}: `);
       setSecret(arg, value);
       console.log(`stored secret:${arg}`);
@@ -196,7 +203,7 @@ async function main() {
     }
     case 'dashboard': {
       const base = localBaseUrl(load(configPath).server);
-      if (!(await reachable(base))) fail('bridge is not running (start it with "agents-bridge up" or "agents-bridge service install")');
+      if (!(await reachable(base))) fail('bridge is not running (start it with "bridge up" or "bridge service install")');
       openBrowser(`${base}/`);
       console.log(`${base}/`);
       return;
@@ -204,10 +211,10 @@ async function main() {
     case 'status': {
       const cfg = load(configPath);
       try {
-        const res = await fetch(`http://${cfg.server.host}:${cfg.server.port}/api/status`);
+        const res = await fetch(`${localBaseUrl(cfg.server)}/api/status`);
         console.log(JSON.stringify(await res.json(), null, 2));
       } catch {
-        fail('bridge is not running (start it with "agents-bridge up")');
+        fail('bridge is not running (start it with "bridge up")');
       }
       return;
     }
@@ -237,7 +244,7 @@ async function run(configPath: string, ims: (cfg: BridgeConfig) => ImAdapter[], 
   const filesDir = join(resolve(configPath, '..', cfg.server.data_dir), 'files');
   const bridge = new Bridge({ cfg, store, ims: ims(cfg), filesDir, log });
   const { mcpUrl } = await bridge.start();
-  log(`agents-bridge up — MCP hub ${mcpUrl}, ${Object.keys(cfg.agents).length} agents, ${cfg.routes.length} routes`);
+  log(`bridge up — MCP hub ${mcpUrl}, ${Object.keys(cfg.agents).length} agents, ${cfg.routes.length} routes`);
   log(`dashboard: ${localBaseUrl(cfg.server)}/`);
 
   let timer: NodeJS.Timeout | undefined;
@@ -263,18 +270,20 @@ async function run(configPath: string, ims: (cfg: BridgeConfig) => ImAdapter[], 
   process.once('SIGTERM', shutdown);
 }
 
-function buildIms(cfg: BridgeConfig): ImAdapter[] {
+function buildIms(cfg: BridgeConfig, dataDir: string): ImAdapter[] {
   const ims: ImAdapter[] = [];
   if (cfg.im.slack) {
     ims.push(new SlackAdapter({ appToken: resolveSecret(cfg.im.slack.app_token), botToken: resolveSecret(cfg.im.slack.bot_token) }));
   }
-  if (cfg.im.telegram) ims.push(new TelegramAdapter({ botToken: resolveSecret(cfg.im.telegram.bot_token) }));
+  if (cfg.im.telegram) {
+    ims.push(new TelegramAdapter({ botToken: resolveSecret(cfg.im.telegram.bot_token), stateFile: join(dataDir, 'telegram.json') }));
+  }
   if (cfg.im.feishu) {
     ims.push(
       new FeishuAdapter({ appId: cfg.im.feishu.app_id, appSecret: resolveSecret(cfg.im.feishu.app_secret), domain: cfg.im.feishu.domain }),
     );
   }
-  if (!ims.length) fail('no IM configured under im: — add one, or try "agents-bridge chat --as <person>"');
+  if (!ims.length) fail('no IM configured under im: — add one, or try "bridge chat --as <person>"');
   return ims;
 }
 
@@ -315,7 +324,7 @@ async function doctor(configPath: string) {
       });
     }
   }
-  const hub = new ToolHub(c.tools, { oauth: { storage: keychainStorage, redirectUrl: `${localBaseUrl(c.server)}/oauth/callback` } });
+  const hub = new ToolHub(c.tools, { oauth: { storage: keychainStorage(), redirectUrl: `${localBaseUrl(c.server)}/oauth/callback` } });
   for (const name of Object.keys(c.tools)) {
     await check(`tool server ${name}`, async () => `${(await hub.listTools(name)).length} tools`);
   }
@@ -325,7 +334,7 @@ async function doctor(configPath: string) {
 
 function load(path: string, exitOnError = true): BridgeConfig {
   if (!existsSync(path)) {
-    const msg = `no config at ${path} — run "agents-bridge init"`;
+    const msg = `no config at ${path} — run "bridge init"`;
     if (exitOnError) fail(msg);
     throw new Error(msg);
   }
@@ -389,10 +398,10 @@ ${JSON.stringify(
    - Event configuration → subscription mode: "Receive events through persistent connection" (长连接),
      add event im.message.receive_v1.
    - Callback configuration → same persistent-connection mode, add card.action.trigger.
-   (Start "agents-bridge up" first: the console only saves long-connection mode while a client is connected.)
+   (Start "bridge up" first: the console only saves long-connection mode while a client is connected.)
 4. Version Management & Release → create a version and publish it (an admin may need to approve).
 5. Credentials & Basic Info → copy App ID and App Secret:
-     agents-bridge secret set feishu_app_secret
+     bridge secret set feishu_app_secret
    and in bridge.yaml:
      im:
        feishu: { app_id: cli_xxx, app_secret: secret:feishu_app_secret, domain: feishu }   # or lark
@@ -424,7 +433,7 @@ function openBrowser(url: string) {
 /** Sign in to an OAuth tool server: through the running bridge, or a temporary local listener. */
 async function auth(cfg: BridgeConfig, server: string | undefined, signOut: boolean) {
   const base = localBaseUrl(cfg.server);
-  const flows = new OAuthFlows(() => cfg.tools, keychainStorage, `${base}/oauth/callback`);
+  const flows = new OAuthFlows(() => cfg.tools, keychainStorage(), `${base}/oauth/callback`);
   const oauthServers = Object.keys(cfg.tools).filter((n) => flows.status(n) !== 'not-oauth');
   if (!server) {
     if (!oauthServers.length) return void console.log('No tool servers use OAuth (add  oauth: true  to an HTTP tool server).');
@@ -432,21 +441,31 @@ async function auth(cfg: BridgeConfig, server: string | undefined, signOut: bool
     return;
   }
   if (flows.status(server) === 'not-oauth') fail(`"${server}" is not an OAuth tool server (${oauthServers.length ? `OAuth servers: ${oauthServers.join(', ')}` : 'none configured'})`);
+  const running = await reachable(base);
   if (signOut) {
-    flows.signOut(server);
-    if (await reachable(base)) await fetch(`${base}/api/oauth/sign-out`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ server }) }).catch(() => {});
+    // The running bridge owns its copy of the tokens; otherwise forget them here.
+    if (running) {
+      const res = await fetch(`${base}/api/oauth/sign-out`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ server }) });
+      if (!res.ok) fail(`sign-out failed: ${((await res.json()) as { error?: string }).error ?? res.status}`);
+    } else flows.signOut(server);
     return void console.log(`signed out of ${server}`);
   }
 
   const start = `${base}/oauth/start/${encodeURIComponent(server)}`;
-  if (await reachable(base)) {
-    // The running bridge handles the callback; wait for the token to land in the keychain.
+  if (running) {
+    // The running bridge handles the callback; wait for this sign-in's outcome.
+    const begun = Date.now();
     console.log(`Opening ${start}\nFinish signing in in the browser…`);
     openBrowser(start);
-    const until = Date.now() + 10 * 60e3;
+    const until = begun + 10 * 60e3;
     while (Date.now() < until) {
-      await new Promise((r) => setTimeout(r, 1500));
-      if (flows.status(server) === 'signed-in') return void console.log(`✓ signed in to ${server}`);
+      await new Promise((r) => setTimeout(r, 1000));
+      const res = await fetch(`${base}/api/oauth/${encodeURIComponent(server)}`).catch(() => undefined);
+      if (!res?.ok) continue;
+      const { last } = (await res.json()) as { last: { at: number; ok: boolean; error?: string } | null };
+      if (!last || last.at < begun) continue;
+      if (last.ok) return void console.log(`✓ signed in to ${server}`);
+      fail(`sign-in failed: ${last.error ?? 'unknown error'}`);
     }
     fail('timed out waiting for the sign-in (10 minutes)');
   }
@@ -461,7 +480,7 @@ async function auth(cfg: BridgeConfig, server: string | undefined, signOut: bool
       }).then((handled) => handled || res.writeHead(404).end());
     });
     http.once('error', reject);
-    http.listen(cfg.server.port, new URL(base).hostname, () => {
+    http.listen(cfg.server.port, new URL(base).hostname.replace(/^\[|\]$/g, ''), () => {
       console.log(`Opening ${start}\nFinish signing in in the browser…`);
       openBrowser(start);
     });
@@ -471,4 +490,27 @@ async function auth(cfg: BridgeConfig, server: string | undefined, signOut: bool
     (err) => fail(`sign-in failed: ${(err as Error).message}`),
   );
   process.exit(0);
+}
+
+/**
+ * launchd starts the bridge with a bare environment: every secret must be in the keychain.
+ * Fail now rather than leave a service that restarts forever.
+ */
+function checkServiceSecrets(cfg: BridgeConfig) {
+  const problems: string[] = [];
+  const visit = (v: unknown, path: string) => {
+    if (typeof v === 'string') {
+      for (const name of envRefs(v)) problems.push(`${path}: env:${name} is not available to the service — store it with "bridge secret set" and use secret:`);
+      for (const m of v.matchAll(/(?:^|\$\{)secret:([^}\s]+)/g)) {
+        try {
+          if (keychainRead(m[1]!) === undefined) problems.push(`${path}: secret "${m[1]}" is not in the keychain — run: bridge secret set ${m[1]}`);
+        } catch (err) {
+          problems.push(`${path}: ${(err as Error).message}`);
+        }
+      }
+    } else if (Array.isArray(v)) v.forEach((x, i) => visit(x, `${path}[${i}]`));
+    else if (v && typeof v === 'object') for (const [k, x] of Object.entries(v)) visit(x, path ? `${path}.${k}` : k);
+  };
+  visit(cfg, '');
+  if (problems.length) fail(`the service could not start with this config:\n  ${problems.join('\n  ')}`);
 }

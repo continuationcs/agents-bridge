@@ -1,6 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { redact } from './redact.ts';
 
 export interface SessionRow {
   key: string;
@@ -57,6 +58,8 @@ export class Store {
         kind TEXT NOT NULL, actor TEXT NOT NULL, detail TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS trace_session ON trace(session_key, id);
+      CREATE INDEX IF NOT EXISTS trace_ts ON trace(ts);
+      CREATE INDEX IF NOT EXISTS sessions_active ON sessions(last_active);
     `);
   }
 
@@ -86,8 +89,19 @@ export class Store {
       .run(now, patch.addSpentUsd ?? 0, key);
   }
 
+  /** Forget a conversation together with its delegation sessions (`<key>>agent`, `<key>>a>b`, …). */
   deleteSession(key: string) {
-    this.db.prepare('DELETE FROM sessions WHERE key = ?').run(key);
+    const prefix = `${key}>`;
+    this.db
+      .prepare('DELETE FROM sessions WHERE key = ? OR substr(key, 1, ?) = ?')
+      .run(key, prefix.length, prefix);
+  }
+
+  /** Keys of the sessions active after `since` (ms epoch). */
+  sessionsActiveSince(since: number): string[] {
+    return (this.db.prepare('SELECT key FROM sessions WHERE last_active > ?').all(since) as { key: string }[]).map(
+      (r) => r.key,
+    );
   }
 
   listSessions(limit = 50): SessionRow[] {
@@ -125,6 +139,20 @@ export class Store {
       .all() as unknown as QueueRow[];
   }
 
+  /**
+   * Retention: finished queue rows created before `queueBefore`; trace entries and sessions idle since before
+   * `historyBefore` (omit to keep them). Returns how many rows went.
+   */
+  prune(opts: { queueBefore: number; historyBefore?: number }): { queue: number; trace: number; sessions: number } {
+    const queue = this.db
+      .prepare(`DELETE FROM queue WHERE status IN ('done', 'failed', 'expired') AND created_at < ?`)
+      .run(opts.queueBefore).changes;
+    if (opts.historyBefore === undefined) return { queue: Number(queue), trace: 0, sessions: 0 };
+    const trace = this.db.prepare('DELETE FROM trace WHERE ts < ?').run(opts.historyBefore).changes;
+    const sessions = this.db.prepare('DELETE FROM sessions WHERE last_active < ?').run(opts.historyBefore).changes;
+    return { queue: Number(queue), trace: Number(trace), sessions: Number(sessions) };
+  }
+
   trace(sessionKey: string, kind: string, actor: string, detail: unknown) {
     this.db
       .prepare('INSERT INTO trace (ts, session_key, kind, actor, detail) VALUES (?, ?, ?, ?, ?)')
@@ -142,18 +170,4 @@ export class Store {
   close() {
     this.db.close();
   }
-}
-
-const SECRET_PATTERNS = [
-  /xox[abposr]-[A-Za-z0-9-]{10,}/g, // Slack tokens
-  /xapp-[A-Za-z0-9-]{10,}/g, // Slack app tokens
-  /\b\d{6,}:[A-Za-z0-9_-]{30,}\b/g, // Telegram bot tokens
-  /\bsk-[A-Za-z0-9_-]{16,}/g, // API keys
-  /\bgh[pousr]_[A-Za-z0-9]{20,}/g, // GitHub tokens
-  /\bBearer\s+[A-Za-z0-9._~+/-]{16,}=*/gi,
-];
-
-/** The audit log keeps everything except credentials. */
-export function redact(s: string): string {
-  return SECRET_PATTERNS.reduce((acc, re) => acc.replace(re, '[redacted]'), s);
 }

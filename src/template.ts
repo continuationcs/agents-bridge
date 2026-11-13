@@ -1,4 +1,9 @@
-export const TEMPLATE = `# agents-bridge config. Edit, then: agents-bridge doctor && agents-bridge up
+import { fileURLToPath } from 'node:url';
+
+/** The bundled example agent; resolves from src/ and from the compiled out/ alike. */
+const ECHO_AGENT = fileURLToPath(new URL('../src/examples/echo-agent.mjs', import.meta.url));
+
+export const TEMPLATE = `# bridge config. Edit, then: bridge doctor && bridge up
 version: 1
 
 # Who is who across IMs. Routes and approvals refer to these ids.
@@ -9,7 +14,7 @@ people:
     # telegram: "123456789"   # your Telegram user id
 
 # IM connections (outbound only; no public URL needed). Store tokens with:
-#   agents-bridge secret set slack_app_token
+#   bridge secret set slack_app_token
 im: {}
   # slack:
   #   app_token: secret:slack_app_token   # xapp-… (Socket Mode)
@@ -21,7 +26,7 @@ agents:
   echo:
     type: stdio
     command: node
-    args: [examples/echo-agent.mjs]
+    args: [${JSON.stringify(ECHO_AGENT)}]
     description: replies with what you sent
   # claude-code:
   #   type: claude-code
@@ -44,7 +49,7 @@ tools: {}
 
 # First match wins; anything unmatched is ignored.
 routes:
-  - from: local:*            # agents-bridge chat
+  - from: local:*            # bridge chat
     when: { sender: [me] }
     to: echo
   # - from: slack:#dev

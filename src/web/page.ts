@@ -7,7 +7,7 @@ export const PAGE = String.raw`<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>agents-bridge</title>
+<title>bridge</title>
 <style>
 :root {
   --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #677085; --line: #e3e6ec;
@@ -95,7 +95,7 @@ button:disabled { opacity: .5; cursor: default; }
 </head>
 <body>
 <header>
-  <h1>agents-bridge</h1>
+  <h1>bridge</h1>
   <span class="chip" id="conn"><span class="dot"></span><span>connecting…</span></span>
   <span class="chip" id="ims"></span>
   <span class="chip" id="uptime"></span>

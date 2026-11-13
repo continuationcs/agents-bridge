@@ -1,21 +1,21 @@
 import assert from 'node:assert/strict';
 import { request } from 'node:http';
 import { test } from 'node:test';
-import type { AgentAdapter, Workspace } from '../src/adapters/agent/types.ts';
-import { parseConfig } from '../src/config/load.ts';
-import { Bridge } from '../src/core/bridge.ts';
-import { Store } from '../src/core/store.ts';
-import { memoryStorage } from '../src/mcp/oauth.ts';
+import type { AgentAdapter, Workspace } from '../adapters/agent/types.ts';
+import { parseConfig } from '../config/load.ts';
+import { Bridge } from '../core/bridge.ts';
+import { Store } from '../core/store.ts';
+import { memoryStorage } from '../mcp/oauth.ts';
 import { FakeIm } from './helpers.ts';
 
 async function setup() {
   const calls: string[] = [];
   const ws: Workspace = {
-    status: (key) => (calls.includes(`gone:${key}`) ? undefined : '🌿 bridge/x: 1 commit'),
-    previewMerge: () => ({ ok: true, summary: 'Squash 1 commit into main' }),
-    merge: () => (calls.push('merge'), '✅ merged'),
-    previewDiscard: () => '1 unmerged commit',
-    discard: () => (calls.push('discard'), '🗑 discarded'),
+    status: async (key) => (calls.includes(`gone:${key}`) ? undefined : '🌿 bridge/x: 1 commit'),
+    previewMerge: async () => ({ ok: true, summary: 'Squash 1 commit into main' }),
+    merge: async () => (calls.push('merge'), '✅ merged'),
+    previewDiscard: async () => '1 unmerged commit',
+    discard: async () => (calls.push('discard'), '🗑 discarded'),
   };
   const cc: AgentAdapter = { name: 'cc', workspace: ws, async run() { return { text: 'done', agentSessionId: 's1' }; } };
   const cfg = parseConfig(`
@@ -39,7 +39,7 @@ test('dashboard: page, overview, deciding a pending choice as the owner', async 
   try {
     const page = await fetch(base + '/');
     assert.equal(page.status, 200);
-    assert.match(await page.text(), /<title>agents-bridge<\/title>/);
+    assert.match(await page.text(), /<title>bridge<\/title>/);
     assert.match(page.headers.get('content-security-policy') ?? '', /frame-ancestors 'none'/);
 
     im.receive({ userId: 'U1', text: 'merge' }); // asks "yes?" and waits

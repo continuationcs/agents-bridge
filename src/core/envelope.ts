@@ -23,7 +23,7 @@ export interface Envelope {
   hops: number;
   /** Remaining USD budget for the whole chain, if a policy set one. */
   budgetUsd?: number;
-  /** Content came from someone outside the trusted set (labelled, not enforced in v0.1). */
+  /** Content came from someone outside the trusted set: `initiator` then never counts as an approver. */
   tainted: boolean;
   createdAt: number;
 }

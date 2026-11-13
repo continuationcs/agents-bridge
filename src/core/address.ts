@@ -1,7 +1,7 @@
 /**
  * Endpoint addresses as written in bridge.yaml:
  *   slack:#dev      IM channel by name      telegram:*   any chat on that IM
- *   slack:dm        direct messages         local:*      the `agents-bridge chat` console
+ *   slack:dm        direct messages         local:*      the `bridge chat` console
  *   claude-code     an agent                github.push  tool `push` on tool server `github`
  */
 export type Address =
@@ -35,6 +35,9 @@ function escapeRe(s: string) {
 }
 
 /** "90s", "10m", "2h", "1d" → milliseconds. */
+/** The longest delay setTimeout honours; longer ones fire immediately. */
+export const MAX_TIMER_MS = 2 ** 31 - 1;
+
 export function parseDuration(s: string): number {
   const m = /^(\d+(?:\.\d+)?)\s*(ms|s|m|h|d)$/.exec(s.trim());
   if (!m) throw new Error(`bad duration "${s}" (use e.g. 30s, 10m, 2h)`);

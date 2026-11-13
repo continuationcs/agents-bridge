@@ -1,5 +1,5 @@
-import type { Choice, ImAdapter, InboundAction, OutboundMessage } from '../src/adapters/im/types.ts';
-import type { InboundMessage } from '../src/core/router.ts';
+import type { Choice, ImAdapter, InboundAction, OutboundMessage } from '../adapters/im/types.ts';
+import type { InboundMessage } from '../core/router.ts';
 
 export class FakeIm implements ImAdapter {
   readonly platform: string;

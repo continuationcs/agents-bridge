@@ -38,7 +38,7 @@ export interface WebTool {
 /** What the dashboard needs from the bridge. */
 export interface WebBackend {
   status(): unknown;
-  webSessions(): WebSession[];
+  webSessions(): Promise<WebSession[]>;
   webTrace(sessionKey: string | undefined, limit: number): { ts: number; session: string; kind: string; actor: string; detail: string }[];
   webChoices(): WebChoice[];
   /** Decide a pending choice as the bridge owner; throws when the owner may not decide it. */
@@ -57,7 +57,7 @@ export interface WebBackend {
 export async function handleWeb(b: WebBackend, req: IncomingMessage, res: ServerResponse, url: URL): Promise<boolean> {
   const path = url.pathname;
   const ours = path === '/' || path.startsWith('/api/') || path.startsWith('/oauth/');
-  if (!ours || path === '/api/status') return false;
+  if (!ours) return false;
 
   if (!isLoopback(req.socket.remoteAddress)) return deny(res, 403, 'the dashboard is only served to this machine');
   const port = req.socket.localPort;
@@ -82,8 +82,13 @@ export async function handleWeb(b: WebBackend, req: IncomingMessage, res: Server
       res.end(PAGE);
       return true;
     }
+    if (path === '/api/status' && req.method === 'GET') return json(res, 200, b.status());
+    const signIn = /^\/api\/oauth\/([\w.-]+)$/.exec(path);
+    if (signIn && req.method === 'GET') {
+      return json(res, 200, { status: b.oauth.status(signIn[1]!), last: b.oauth.lastResult(signIn[1]!) ?? null });
+    }
     if (path === '/api/overview' && req.method === 'GET') {
-      return json(res, 200, { status: b.status(), sessions: b.webSessions(), choices: b.webChoices() });
+      return json(res, 200, { status: b.status(), sessions: await b.webSessions(), choices: b.webChoices() });
     }
     if (path === '/api/trace' && req.method === 'GET') {
       const limit = Math.min(Number(url.searchParams.get('limit') ?? 200) || 200, 2000);

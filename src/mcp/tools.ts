@@ -1,9 +1,10 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
-import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { getDefaultEnvironment, StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { StreamableHTTPClientTransport, StreamableHTTPError } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { McpError, type Tool } from '@modelcontextprotocol/sdk/types.js';
 import type { HttpToolServerConfig, ToolServerConfig } from '../config/schema.ts';
+import { parseDuration } from '../core/address.ts';
 import { resolveSecret, resolveTemplate } from '../secrets.ts';
 import { BridgeOAuthProvider, NeedsSignIn, type OAuthStorage } from './oauth.ts';
 
@@ -12,21 +13,17 @@ export interface ToolHubOptions {
   oauth?: { storage: OAuthStorage; redirectUrl: string };
 }
 
-export interface ProxiedTool {
-  server: string;
-  tool: Tool;
-}
-
 /**
  * External tool servers (MCP over stdio or HTTP). The bridge connects with its own service
  * credentials and re-exposes the tools each agent's routes allow.
  */
 export class ToolHub {
   private servers: Record<string, ToolServerConfig>;
+  private readonly opts: ToolHubOptions;
   private readonly clients = new Map<string, Promise<Client>>();
   private readonly toolCache = new Map<string, Tool[]>();
-
-  private readonly opts: ToolHubOptions;
+  /** Bumped whenever a server's connection is discarded, so late results of an old connection are not cached. */
+  private readonly generation = new Map<string, number>();
 
   constructor(servers: Record<string, ToolServerConfig>, opts: ToolHubOptions = {}) {
     this.servers = servers;
@@ -34,13 +31,16 @@ export class ToolHub {
   }
 
   config(server: string): ToolServerConfig | undefined {
-    return this.servers[server];
+    return Object.hasOwn(this.servers, server) ? this.servers[server] : undefined;
+  }
+
+  serverNames(): string[] {
+    return Object.keys(this.servers);
   }
 
   /** Forget the connection and cached tool list (e.g. after signing in again). */
   async reset(server: string) {
-    this.toolCache.delete(server);
-    await this.drop(server);
+    await this.discard(server);
   }
 
   /** Config reload: new servers become available; changed or removed ones are disconnected. */
@@ -48,21 +48,16 @@ export class ToolHub {
     const old = this.servers;
     this.servers = servers;
     for (const name of Object.keys(old)) {
-      if (JSON.stringify(old[name]) === JSON.stringify(servers[name])) continue;
-      this.toolCache.delete(name);
-      await this.drop(name);
+      if (JSON.stringify(old[name]) !== JSON.stringify(servers[name])) await this.discard(name);
     }
-  }
-
-  serverNames(): string[] {
-    return Object.keys(this.servers);
   }
 
   async listTools(server: string): Promise<Tool[]> {
     const cached = this.toolCache.get(server);
     if (cached) return cached;
-    const { tools } = await this.retry(server, (c) => c.listTools());
-    this.toolCache.set(server, tools);
+    const gen = this.generation.get(server) ?? 0;
+    const { tools } = await this.withClient(server, true, (c) => c.listTools());
+    if ((this.generation.get(server) ?? 0) === gen) this.toolCache.set(server, tools);
     return tools;
   }
 
@@ -73,62 +68,113 @@ export class ToolHub {
   }
 
   async callTool(server: string, tool: string, args: Record<string, unknown>) {
-    return this.retry(server, (c) => c.callTool({ name: tool, arguments: args }));
-  }
-
-  /** One reconnect on failure: remote sessions expire, local servers crash. */
-  private async retry<T>(server: string, fn: (c: Client) => Promise<T>): Promise<T> {
-    try {
-      return await fn(await this.client(server));
-    } catch (err) {
-      if (isToolError(err)) throw err;
-      await this.drop(server);
-      return fn(await this.client(server));
-    }
-  }
-
-  private async drop(server: string) {
-    const p = this.clients.get(server);
-    this.clients.delete(server);
-    try {
-      await (await p)?.close();
-    } catch {
-      /* already gone */
-    }
+    const cfg = this.mustConfig(server);
+    // Replaying a write after an ambiguous failure could run it twice; only read-only tools are retried freely.
+    const idempotent = await this.isReadOnly(server, tool);
+    return this.withClient(server, idempotent, (c) =>
+      c.callTool({ name: tool, arguments: args }, undefined, { timeout: parseDuration(cfg.timeout), resetTimeoutOnProgress: true }),
+    );
   }
 
   async stop() {
-    for (const p of this.clients.values()) {
-      try {
-        await (await p).close();
-      } catch {
-        /* already gone */
-      }
-    }
+    const all = [...this.clients.values()];
     this.clients.clear();
+    await Promise.all(all.map((p) => closeQuietly(p)));
   }
 
-  private client(server: string): Promise<Client> {
-    let p = this.clients.get(server);
-    if (!p) {
-      const cfg = this.servers[server];
-      if (!cfg) throw new Error(`unknown tool server "${server}"`);
-      p = 'url' in cfg ? connectHttp(server, cfg, this.opts) : (async () => {
-        const env: Record<string, string> = { ...(process.env as Record<string, string>) };
-        for (const [k, v] of Object.entries(cfg.env)) env[k] = resolveSecret(v);
-        const client = newClient();
-        await client.connect(new StdioClientTransport({ command: cfg.command, args: cfg.args, env, stderr: 'ignore' }));
-        return client;
-      })();
-      p.catch(() => this.clients.delete(server));
-      this.clients.set(server, p);
+  /**
+   * Run `fn` on the server's connection. When the connection turns out to be dead, reconnect once and
+   * retry — always if the request never reached the server, otherwise only when `idempotent`.
+   */
+  private async withClient<T>(server: string, idempotent: boolean, fn: (c: Client) => Promise<T>): Promise<T> {
+    const p = this.connection(server);
+    const client = await p;
+    try {
+      return await fn(client);
+    } catch (err) {
+      if (err instanceof McpError) throw err; // the server answered: bad arguments, unknown tool, timeout…
+      await this.forget(server, p);
+      if (!idempotent && !neverSent(err)) throw err;
+      return fn(await this.connection(server));
     }
+  }
+
+  private mustConfig(server: string): ToolServerConfig {
+    const cfg = this.config(server);
+    if (!cfg) throw new Error(`unknown tool server "${server}"`);
+    return cfg;
+  }
+
+  private connection(server: string): Promise<Client> {
+    const existing = this.clients.get(server);
+    if (existing) return existing;
+    const cfg = this.mustConfig(server);
+    const p = 'url' in cfg ? connectHttp(server, cfg, this.opts) : connectStdio(server, cfg);
+    this.clients.set(server, p);
+    // A failed connect is forgotten so the next call tries again — but only if it is still the current one.
+    p.catch(() => {
+      if (this.clients.get(server) === p) this.clients.delete(server);
+    });
     return p;
+  }
+
+  /** Drop this particular connection (not whatever replaced it in the meantime). */
+  private async forget(server: string, p: Promise<Client>) {
+    if (this.clients.get(server) === p) {
+      this.clients.delete(server);
+      this.generation.set(server, (this.generation.get(server) ?? 0) + 1);
+      this.toolCache.delete(server);
+    }
+    await closeQuietly(p);
+  }
+
+  private async discard(server: string) {
+    this.generation.set(server, (this.generation.get(server) ?? 0) + 1);
+    this.toolCache.delete(server);
+    const p = this.clients.get(server);
+    this.clients.delete(server);
+    if (p) await closeQuietly(p);
   }
 }
 
+async function closeQuietly(p: Promise<Client>) {
+  try {
+    await (await p).close();
+  } catch {
+    /* never connected, or already closed */
+  }
+}
+
+/** Failures where the request cannot have reached the server, so sending it again is safe. */
+function neverSent(err: unknown): boolean {
+  if (err instanceof StreamableHTTPError && err.code === 404) return true; // session expired: rejected before running
+  const code = (err as { cause?: { code?: string } })?.cause?.code;
+  if (code === 'ECONNREFUSED') return true;
+  return /^Not connected$/.test((err as Error)?.message ?? '');
+}
+
 function newClient() {
-  return new Client({ name: 'agents-bridge', version: '0.1.0' });
+  return new Client({ name: 'bridge', version: '0.1.0' });
+}
+
+/** A local server as a child process. It gets a minimal environment plus its own `env`, never the bridge's secrets. */
+async function connectStdio(name: string, cfg: Extract<ToolServerConfig, { command: string }>): Promise<Client> {
+  const env = getDefaultEnvironment();
+  for (const [k, v] of Object.entries(cfg.env)) env[k] = resolveSecret(v);
+  const transport = new StdioClientTransport({ command: cfg.command, args: cfg.args, env, stderr: 'pipe' });
+  // Keep the end of stderr so a server that dies at startup can say why.
+  let tail = '';
+  transport.stderr?.on('data', (chunk: Buffer) => {
+    tail = (tail + chunk.toString()).slice(-2000);
+  });
+  const client = newClient();
+  try {
+    await client.connect(transport);
+    return client;
+  } catch (err) {
+    const why = tail.trim() ? `\n${tail.trim().split('\n').slice(-5).join('\n')}` : '';
+    throw new Error(`${name}: ${(err as Error).message}${why}`);
+  }
 }
 
 async function connectHttp(name: string, cfg: HttpToolServerConfig, opts: ToolHubOptions): Promise<Client> {
@@ -149,13 +195,16 @@ async function connectHttp(name: string, cfg: HttpToolServerConfig, opts: ToolHu
       return client;
     } catch (err) {
       const e = describe(err, cfg.url);
-      if (cfg.transport === 'streamable-http' || /unauthorized|not signed in/.test(e.message)) throw e;
+      if (cfg.transport === 'streamable-http' || err instanceof NeedsSignIn || /unauthorized/.test(e.message)) throw e;
       // auto: older servers only speak SSE (GET /sse + POST /messages).
     }
   }
   const client = newClient();
   try {
-    await client.connect(new SSEClientTransport(url, { ...init, eventSourceInit: { fetch: (u, i) => fetch(u, { ...i, headers: { ...headers, ...(i?.headers as Record<string, string>) } }) } }));
+    const eventSourceInit = {
+      fetch: (u: string | URL, i?: RequestInit) => fetch(u, { ...i, headers: { ...headers, ...(i?.headers as Record<string, string>) } }),
+    };
+    await client.connect(new SSEClientTransport(url, { ...init, eventSourceInit }));
     return client;
   } catch (err) {
     throw describe(err, cfg.url);
@@ -167,10 +216,4 @@ function describe(err: unknown, url: string): Error {
   const msg = (err as Error)?.message ?? String(err);
   if (/\b401\b|unauthori[sz]ed/i.test(msg)) return new Error(`${url}: unauthorized — check the headers (API key / bearer token)`);
   return new Error(`${url}: ${msg}`);
-}
-
-/** Errors the server returned on purpose (bad arguments, unknown tool) — reconnecting won't help. */
-function isToolError(err: unknown): boolean {
-  // McpError = a JSON-RPC error reply. Transport errors (HTTP 404 for an expired session, ECONNRESET…) are not.
-  return err instanceof McpError;
 }

@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 /** Run the bridge as a macOS LaunchAgent: starts at login, restarted by launchd if it exits. */
-const LABEL = 'dev.agents-bridge';
+const LABEL = 'dev.bridge';
 const PLIST = join(homedir(), 'Library', 'LaunchAgents', `${LABEL}.plist`);
 const domain = () => `gui/${process.getuid!()}`;
 

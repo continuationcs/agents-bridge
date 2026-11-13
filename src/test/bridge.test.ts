@@ -3,10 +3,10 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { parseConfig } from '../src/config/load.ts';
-import { Bridge } from '../src/core/bridge.ts';
-import { Store } from '../src/core/store.ts';
-import type { AgentAdapter, AgentTurn } from '../src/adapters/agent/types.ts';
+import { parseConfig } from '../config/load.ts';
+import { Bridge } from '../core/bridge.ts';
+import { Store } from '../core/store.ts';
+import type { AgentAdapter, AgentTurn } from '../adapters/agent/types.ts';
 import { FakeIm } from './helpers.ts';
 
 const yaml = (extraRoutes = '', extraPolicies = '') => `
@@ -14,11 +14,11 @@ server: { port: 0 }
 people: { alice: { trust: owner, slack: U1 }, bob: { trust: member, slack: U2 } }
 im: { slack: { app_token: env:A, bot_token: env:B } }
 agents:
-  echo: { type: stdio, command: node, args: [examples/echo-agent.mjs] }
+  echo: { type: stdio, command: node, args: [src/examples/echo-agent.mjs] }
   boss: { type: stdio, command: "true" }
   helper: { type: stdio, command: "true" }
 tools:
-  fake: { command: node, args: [test/fixtures/tool-server.mjs] }
+  fake: { command: node, args: [src/test/fixtures/tool-server.mjs] }
 routes:
   - { from: "slack:#dev", when: { sender: [alice] }, to: echo }
   - { from: "slack:#boss", when: { sender: [alice, bob] }, to: boss }
@@ -320,7 +320,7 @@ test('attachments are downloaded per conversation and handed to the agent; overs
     // older than files_ttl (7d) → removed by housekeeping
     const old = Date.now() / 1000 - 8 * 86400;
     utimesSync(files[0]!.path, old, old);
-    bridge.cleanUp();
+    await bridge.cleanUp();
     assert.ok(!existsSync(files[0]!.path));
   } finally {
     await bridge.stop();

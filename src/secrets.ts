@@ -1,9 +1,20 @@
 import { execFileSync } from 'node:child_process';
+import { registerSecret } from './core/redact.ts';
 
-const SERVICE = 'agents-bridge';
+/** Keychain service name for every secret the bridge stores. */
+const SERVICE = 'dev.bridge';
+/** `security` exits with this when the item does not exist. */
+const NOT_FOUND = 44;
 
-/** Resolve `secret:<name>` (OS keychain, falling back to AGENTS_BRIDGE_SECRET_<NAME>), `env:<NAME>`, or a literal. */
+/** Resolve `secret:<name>` (OS keychain, falling back to BRIDGE_SECRET_<NAME>), `env:<NAME>`, or a literal. */
 export function resolveSecret(ref: string): string {
+  const value = lookup(ref);
+  // Anything that came from a secret store or the environment is kept out of the audit trail.
+  if (value !== ref) registerSecret(value);
+  return value;
+}
+
+function lookup(ref: string): string {
   if (ref.startsWith('env:')) {
     const name = ref.slice(4);
     const v = process.env[name];
@@ -12,19 +23,9 @@ export function resolveSecret(ref: string): string {
   }
   if (ref.startsWith('secret:')) {
     const name = ref.slice(7);
-    const fromEnv = process.env[envName(name)];
-    if (fromEnv) return fromEnv;
-    if (process.platform === 'darwin') {
-      try {
-        return execFileSync('security', ['find-generic-password', '-s', SERVICE, '-a', name, '-w'], {
-          encoding: 'utf8',
-          stdio: ['ignore', 'pipe', 'ignore'],
-        }).trim();
-      } catch {
-        /* fall through */
-      }
-    }
-    throw new Error(`secret "${name}" not found — run: agents-bridge secret set ${name}  (or set ${envName(name)})`);
+    const v = process.env[envName(name)] || keychainRead(name);
+    if (v === undefined) throw new Error(`secret "${name}" not found — run: bridge secret set ${name}  (or set ${envName(name)})`);
+    return v;
   }
   return ref;
 }
@@ -37,36 +38,61 @@ export function resolveTemplate(value: string): string {
   return resolveSecret(value);
 }
 
+/** Every `env:` reference in a value (whole ref or ${env:X} inside a template). */
+export function envRefs(value: string): string[] {
+  if (value.startsWith('env:')) return [value.slice(4)];
+  return [...value.matchAll(/\$\{env:([^}]+)\}/g)].map((m) => m[1]!);
+}
+
 export function setSecret(name: string, value: string) {
   if (process.platform !== 'darwin') {
     throw new Error(`no keychain support on ${process.platform} yet — export ${envName(name)} instead`);
   }
+  // `security -i` takes one command per line; a line break would end the value and start another command.
+  if (/[\r\n]/.test(value)) throw new Error('secrets must be a single line');
+  if (!value) throw new Error('empty secret');
   // `security -i` reads the command from stdin, so the value never appears in argv (visible to `ps`).
   const q = (v: string) => `"${v.replace(/(["\\])/g, '\\$1')}"`;
-  execFileSync('security', ['-i'], {
+  const out = execFileSync('security', ['-i'], {
     input: `add-generic-password -U -s ${q(SERVICE)} -a ${q(name)} -w ${q(value)}\n`,
-    stdio: ['pipe', 'ignore', 'pipe'],
+    encoding: 'utf8',
+    stdio: ['pipe', 'pipe', 'pipe'],
   });
+  // `security -i` exits 0 even when a command fails, so check that the value really landed.
+  if (keychainRead(name) !== value) {
+    throw new Error(`the keychain did not store "${name}"${out.trim() ? `: ${out.trim()}` : ''}`);
+  }
 }
 
-/** Read a stored secret, or undefined when there is none (no error). */
+/** Read a stored secret, or undefined when there is none. Keychain failures (locked, denied) throw. */
 export function readSecret(name: string): string | undefined {
-  try {
-    return resolveSecret(`secret:${name}`);
-  } catch {
-    return undefined;
-  }
+  return process.env[envName(name)] || keychainRead(name);
 }
 
 export function deleteSecret(name: string) {
   if (process.platform !== 'darwin') return;
   try {
     execFileSync('security', ['delete-generic-password', '-s', SERVICE, '-a', name], { stdio: 'ignore' });
-  } catch {
-    /* not there */
+  } catch (err) {
+    if ((err as { status?: number }).status !== NOT_FOUND) throw new Error(`could not delete "${name}" from the keychain`);
+  }
+}
+
+/** The keychain alone (no environment fallback): what a background service will find. */
+export function keychainRead(name: string): string | undefined {
+  if (process.platform !== 'darwin') return undefined;
+  try {
+    return execFileSync('security', ['find-generic-password', '-s', SERVICE, '-a', name, '-w'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).replace(/\n$/, '');
+  } catch (err) {
+    if ((err as { status?: number }).status === NOT_FOUND) return undefined;
+    const why = String((err as { stderr?: string }).stderr ?? '').trim();
+    throw new Error(`could not read "${name}" from the keychain${why ? `: ${why}` : ''}`);
   }
 }
 
 function envName(name: string) {
-  return `AGENTS_BRIDGE_SECRET_${name.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`;
+  return `BRIDGE_SECRET_${name.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`;
 }

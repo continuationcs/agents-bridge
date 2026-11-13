@@ -1,5 +1,5 @@
-/** Slack app manifest for agents-bridge: Socket Mode, DMs, and channel messages. Paste at api.slack.com/apps → From a manifest. */
-export function slackManifest(name = 'agents-bridge'): string {
+/** Slack app manifest for bridge: Socket Mode, DMs, and channel messages. Paste at api.slack.com/apps → From a manifest. */
+export function slackManifest(name = 'bridge'): string {
   return `display_information:
   name: ${name}
   description: Talk to your agents from Slack

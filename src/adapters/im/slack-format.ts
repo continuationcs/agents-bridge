@@ -1,7 +1,9 @@
 /**
  * Standard Markdown (what agents write) → Slack mrkdwn.
  * Slack has no headings or tables and uses *bold*, _italic_, ~strike~, <url|text>.
- * Tables become aligned monospace blocks; code is left untouched.
+ * Tables become aligned monospace blocks; code keeps its text. `&`, `<` and `>` are escaped everywhere,
+ * code included: Slack parses control sequences (`<!channel>`, `<@U…>`, links) in all text and shows
+ * the entities in code as the plain characters.
  */
 export function toSlackMrkdwn(md: string): string {
   const out: string[] = [];
@@ -10,13 +12,13 @@ export function toSlackMrkdwn(md: string): string {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]!;
 
-    // Fenced code: copy verbatim, drop the language tag Slack would print.
+    // Fenced code: same text (escaped), without the language tag Slack would print.
     const fence = /^(\s*)(```|~~~)/.exec(line);
     if (fence) {
       const marker = fence[2]!;
       out.push('```');
       i++;
-      while (i < lines.length && !lines[i]!.trimStart().startsWith(marker)) out.push(lines[i++]!);
+      while (i < lines.length && !lines[i]!.trimStart().startsWith(marker)) out.push(escape(lines[i++]!));
       out.push('```');
       continue;
     }
@@ -58,18 +60,23 @@ export function toSlackMrkdwn(md: string): string {
   return out.join('\n');
 }
 
-/** Inline spans, with `code` protected from every other rule. */
+/** Inline spans, with `code` protected from every other rule (but still escaped). */
 function inline(text: string): string {
   return text
     .split(/(`[^`\n]+`)/)
-    .map((part, idx) => (idx % 2 === 1 ? part : inlinePlain(part)))
+    .map((part, idx) => (idx % 2 === 1 ? escape(part) : inlinePlain(part)))
     .join('');
+}
+
+/** The three characters Slack requires as entities in any text. */
+export function escape(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 const BOLD = '\u0001';
 
 function inlinePlain(s: string): string {
-  s = s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  s = escape(s);
   // Links and images: [text](url) → <url|text>
   s = s.replace(/!?\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (_m, label: string, url: string) =>
     label ? `<${url}|${label}>` : `<${url}>`,
@@ -132,7 +139,7 @@ function renderRecords(rows: string[][]): string {
       const title = `*${inline(r[0] ?? '').replace(/\*/g, '')}*`;
       const items = r.slice(1).flatMap((cell, i) => {
         const parts = cell.split(/<br\s*\/?>/i).map((p) => inline(p.trim())).filter(Boolean);
-        const label = head[i + 1] ? `${head[i + 1]}: ` : '';
+        const label = head[i + 1] ? `${escape(head[i + 1]!)}: ` : '';
         if (parts.length <= 1) return [`• ${label}${parts[0] ?? '—'}`];
         return [`• ${label}`, ...parts.map((p) => `    ◦ ${p}`)];
       });
@@ -149,7 +156,8 @@ function renderGrid(rows: string[][]): string {
       .map((w, c) => pad(r[c] ?? '', w))
       .join('  ')
       .trimEnd();
-  const lines = [fmt(rows[0]!), widths.map((w) => '─'.repeat(w)).join('  '), ...rows.slice(1).map(fmt)];
+  // Padded on the plain text (escaping changes lengths, not what is shown), then escaped.
+  const lines = [fmt(rows[0]!), widths.map((w) => '─'.repeat(w)).join('  '), ...rows.slice(1).map(fmt)].map(escape);
   return ['```', ...lines, '```'].join('\n');
 }
 
@@ -176,4 +184,20 @@ export function width(s: string): number {
         : 1;
   }
   return n;
+}
+
+/**
+ * Cut mrkdwn to at most `max` characters for a Slack block (section text is limited to 3000), at a
+ * line break when there is one in reach, without splitting an entity or <link>, and closing a code
+ * fence left open; "…" marks the cut.
+ */
+export function truncateMrkdwn(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const room = max - '\n```\n…'.length;
+  let cut = text.slice(0, room).replace(/[\uD800-\uDBFF]$/, '');
+  const nl = cut.lastIndexOf('\n');
+  if (nl > room / 2) cut = cut.slice(0, nl);
+  else cut = cut.replace(/&[a-z]*$/, '').replace(/<[^>\n]*$/, '');
+  const open = (cut.match(/```/g) ?? []).length % 2 === 1;
+  return `${cut}${open ? '\n```' : ''}\n…`;
 }

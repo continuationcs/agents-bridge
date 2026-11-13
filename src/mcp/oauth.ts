@@ -3,6 +3,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { auth, type OAuthClientProvider } from '@modelcontextprotocol/sdk/client/auth.js';
 import type { OAuthClientInformationMixed, OAuthClientMetadata, OAuthTokens } from '@modelcontextprotocol/sdk/shared/auth.js';
 import type { HttpToolServerConfig } from '../config/schema.ts';
+import { registerSecret } from '../core/redact.ts';
 import { deleteSecret, readSecret, resolveSecret, setSecret } from '../secrets.ts';
 
 /** Where OAuth state lives. Default: the OS keychain, one item per server (`oauth.<server>`). */
@@ -17,28 +18,47 @@ export interface StoredAuth {
   client?: OAuthClientInformationMixed;
   clientRedirect?: string;
   tokens?: OAuthTokens;
-  /** When the access token expires (ms epoch), if the server said. */
-  expiresAt?: number;
-  verifier?: string;
 }
 
-export const keychainStorage: OAuthStorage = {
-  get(server) {
+/**
+ * Keychain-backed storage with an in-memory copy: the SDK asks for tokens on every request, and
+ * reading the keychain spawns a process. Writes go through to the keychain immediately.
+ */
+export function keychainStorage(): OAuthStorage {
+  const cache = new Map<string, StoredAuth>();
+  const load = (server: string): StoredAuth => {
+    const hit = cache.get(server);
+    if (hit) return hit;
     const raw = readSecret(`oauth.${server}`);
-    if (!raw) return {};
-    try {
-      return JSON.parse(raw) as StoredAuth;
-    } catch {
-      return {};
+    let value: StoredAuth = {};
+    if (raw) {
+      try {
+        value = JSON.parse(raw) as StoredAuth;
+      } catch {
+        throw new Error(`the stored sign-in for "${server}" is unreadable — run: bridge auth ${server} --sign-out, then sign in again`);
+      }
     }
-  },
-  set(server, value) {
-    setSecret(`oauth.${server}`, JSON.stringify(value));
-  },
-  delete(server) {
-    deleteSecret(`oauth.${server}`);
-  },
-};
+    registerTokens(value);
+    cache.set(server, value);
+    return value;
+  };
+  return {
+    get: (server) => structuredClone(load(server)),
+    set(server, value) {
+      setSecret(`oauth.${server}`, JSON.stringify(value));
+      registerTokens(value);
+      cache.set(server, structuredClone(value));
+    },
+    delete(server) {
+      deleteSecret(`oauth.${server}`);
+      cache.delete(server);
+    },
+  };
+}
+
+function registerTokens(value: StoredAuth) {
+  for (const t of [value.tokens?.access_token, value.tokens?.refresh_token]) if (t) registerSecret(t);
+}
 
 export function memoryStorage(): OAuthStorage {
   const m = new Map<string, StoredAuth>();
@@ -51,28 +71,42 @@ export function memoryStorage(): OAuthStorage {
 
 export class NeedsSignIn extends Error {
   constructor(server: string) {
-    super(`not signed in to "${server}" — run: agents-bridge auth ${server}  (or use Connect in the web UI)`);
+    super(`not signed in to "${server}" — run: bridge auth ${server}  (or use Connect in the web UI)`);
   }
 }
 
 /**
- * The SDK's OAuth hooks, backed by OAuthStorage. Without `onRedirect` (normal tool calls) it never
- * starts a browser flow: tokens are used and refreshed, and a missing/revoked grant raises NeedsSignIn.
+ * The SDK's OAuth hooks for one tool server.
+ *
+ * Normal use (no `flow`): stored tokens are used and refreshed; a missing or revoked grant raises
+ * NeedsSignIn — a tool call never opens a browser.
+ *
+ * Sign-in (`flow`): starts from no tokens and keeps the PKCE verifier and any new client registration in
+ * memory, so an abandoned or concurrent sign-in never disturbs the stored grant. Only a successful token
+ * exchange replaces what is stored.
  */
 export class BridgeOAuthProvider implements OAuthClientProvider {
-  private pendingState?: string;
   private readonly server: string;
   private readonly cfg: HttpToolServerConfig;
   private readonly storage: OAuthStorage;
   readonly redirectUrl: string;
-  private readonly onRedirect?: (url: URL) => void;
+  private readonly flow?: { onRedirect: (url: URL) => void };
+  private verifier?: string;
+  private flowClient?: OAuthClientInformationMixed;
+  private flowTokens?: OAuthTokens;
 
-  constructor(server: string, cfg: HttpToolServerConfig, storage: OAuthStorage, redirectUrl: string, onRedirect?: (url: URL) => void) {
+  constructor(
+    server: string,
+    cfg: HttpToolServerConfig,
+    storage: OAuthStorage,
+    redirectUrl: string,
+    flow?: { onRedirect: (url: URL) => void },
+  ) {
     this.server = server;
     this.cfg = cfg;
     this.storage = storage;
     this.redirectUrl = redirectUrl;
-    this.onRedirect = onRedirect;
+    this.flow = flow;
   }
 
   private get opts() {
@@ -82,7 +116,7 @@ export class BridgeOAuthProvider implements OAuthClientProvider {
   get clientMetadata(): OAuthClientMetadata {
     const secret = !!this.opts.client_secret;
     return {
-      client_name: 'agents-bridge',
+      client_name: 'bridge',
       redirect_uris: [this.redirectUrl],
       grant_types: ['authorization_code', 'refresh_token'],
       response_types: ['code'],
@@ -92,12 +126,7 @@ export class BridgeOAuthProvider implements OAuthClientProvider {
   }
 
   state() {
-    this.pendingState = randomBytes(16).toString('base64url');
-    return this.pendingState;
-  }
-
-  get lastState() {
-    return this.pendingState;
+    return randomBytes(16).toString('base64url');
   }
 
   clientInformation(): OAuthClientInformationMixed | undefined {
@@ -107,43 +136,55 @@ export class BridgeOAuthProvider implements OAuthClientProvider {
         ...(this.opts.client_secret ? { client_secret: resolveSecret(this.opts.client_secret) } : {}),
       };
     }
+    if (this.flowClient) return this.flowClient;
     const s = this.storage.get(this.server);
     // Registered for another redirect URL (the port changed): register again.
     return s.client && s.clientRedirect === this.redirectUrl ? s.client : undefined;
   }
 
   saveClientInformation(client: OAuthClientInformationMixed) {
-    this.update({ client, clientRedirect: this.redirectUrl });
+    if (this.flow) this.flowClient = client;
+    else this.update({ client, clientRedirect: this.redirectUrl });
   }
 
   tokens(): OAuthTokens | undefined {
-    return this.storage.get(this.server).tokens;
+    return this.flow ? this.flowTokens : this.storage.get(this.server).tokens;
   }
 
   saveTokens(tokens: OAuthTokens) {
-    this.update({ tokens, expiresAt: tokens.expires_in ? Date.now() + tokens.expires_in * 1000 : undefined });
+    if (this.flow) this.flowTokens = tokens;
+    // A sign-in stores its client together with the tokens it was issued for.
+    this.update({ tokens, ...(this.flowClient ? { client: this.flowClient, clientRedirect: this.redirectUrl } : {}) });
   }
 
   redirectToAuthorization(url: URL) {
-    if (!this.onRedirect) throw new NeedsSignIn(this.server);
-    this.onRedirect(url);
+    if (!this.flow) throw new NeedsSignIn(this.server);
+    this.flow.onRedirect(url);
   }
 
   saveCodeVerifier(verifier: string) {
-    this.update({ verifier });
+    this.verifier = verifier;
   }
 
   codeVerifier(): string {
-    const v = this.storage.get(this.server).verifier;
-    if (!v) throw new Error('no PKCE verifier saved — start the sign-in again');
-    return v;
+    if (!this.verifier) throw new Error('no sign-in in progress — start it again');
+    return this.verifier;
   }
 
   invalidateCredentials(scope: 'all' | 'client' | 'tokens' | 'verifier' | 'discovery') {
+    if (scope === 'discovery') return;
+    if (scope === 'verifier') {
+      this.verifier = undefined;
+      return;
+    }
+    if (this.flow) {
+      if (scope !== 'tokens') this.flowClient = undefined;
+      if (scope !== 'client') this.flowTokens = undefined;
+      return;
+    }
     const s = this.storage.get(this.server);
     if (scope === 'all' || scope === 'client') delete s.client, delete s.clientRedirect;
-    if (scope === 'all' || scope === 'tokens') delete s.tokens, delete s.expiresAt;
-    if (scope === 'all' || scope === 'verifier') delete s.verifier;
+    if (scope === 'all' || scope === 'tokens') delete s.tokens;
     this.storage.set(this.server, s);
   }
 
@@ -154,49 +195,66 @@ export class BridgeOAuthProvider implements OAuthClientProvider {
 
 export type OAuthStatus = 'signed-in' | 'signed-out' | 'not-oauth';
 
+export interface SignInResult {
+  at: number;
+  ok: boolean;
+  error?: string;
+}
+
 /**
  * Browser sign-in flows: GET /oauth/start/<server> redirects to the provider, which comes back to
  * GET /oauth/callback. Served by the bridge's local HTTP server (or a temporary one from the CLI).
  */
 export class OAuthFlows {
   private readonly pending = new Map<string, { server: string; provider: BridgeOAuthProvider; at: number }>();
-
+  private readonly results = new Map<string, SignInResult>();
   private readonly servers: () => Record<string, unknown>;
   readonly storage: OAuthStorage;
   readonly redirectUrl: string;
   /** Called after a sign-in or sign-out (e.g. to reconnect the tool server). */
-  private readonly onSignedIn: (server: string) => void;
+  private readonly onChange: (server: string) => void;
 
-  constructor(servers: () => Record<string, unknown>, storage: OAuthStorage, redirectUrl: string, onSignedIn: (server: string) => void = () => {}) {
+  constructor(servers: () => Record<string, unknown>, storage: OAuthStorage, redirectUrl: string, onChange: (server: string) => void = () => {}) {
     this.servers = servers;
     this.storage = storage;
     this.redirectUrl = redirectUrl;
-    this.onSignedIn = onSignedIn;
+    this.onChange = onChange;
+  }
+
+  private oauthConfig(server: string): HttpToolServerConfig | undefined {
+    const all = this.servers();
+    const cfg = Object.hasOwn(all, server) ? (all[server] as HttpToolServerConfig) : undefined;
+    return cfg && 'url' in cfg && cfg.oauth ? cfg : undefined;
   }
 
   private config(server: string): HttpToolServerConfig {
-    const cfg = this.servers()[server] as HttpToolServerConfig | undefined;
-    if (!cfg) throw new Error(`unknown tool server "${server}"`);
-    if (!('url' in cfg) || !cfg.oauth) throw new Error(`tool server "${server}" does not use OAuth (add  oauth: true  to it)`);
+    const cfg = this.oauthConfig(server);
+    if (!cfg) {
+      if (!Object.hasOwn(this.servers(), server)) throw new Error(`unknown tool server "${server}"`);
+      throw new Error(`tool server "${server}" does not use OAuth (add  oauth: true  to it)`);
+    }
     return cfg;
   }
 
   status(server: string): OAuthStatus {
-    const cfg = this.servers()[server] as HttpToolServerConfig | undefined;
-    if (!cfg || !('url' in cfg) || !cfg.oauth) return 'not-oauth';
+    if (!this.oauthConfig(server)) return 'not-oauth';
     return this.storage.get(server).tokens ? 'signed-in' : 'signed-out';
   }
 
-  /** Begin a sign-in; returns the provider URL to send the browser to. */
+  /** How the latest sign-in to this server ended, if one ended since the bridge started. */
+  lastResult(server: string): SignInResult | undefined {
+    return this.results.get(server);
+  }
+
+  /** Begin a sign-in; returns the provider URL to send the browser to. Stored tokens stay until it succeeds. */
   async start(server: string): Promise<URL> {
     const cfg = this.config(server);
     let target: URL | undefined;
-    const provider = new BridgeOAuthProvider(server, cfg, this.storage, this.redirectUrl, (u) => (target = u));
-    provider.invalidateCredentials('tokens'); // an explicit sign-in always asks again
+    const provider = new BridgeOAuthProvider(server, cfg, this.storage, this.redirectUrl, { onRedirect: (u) => (target = u) });
     const scope = typeof cfg.oauth === 'object' ? cfg.oauth.scopes?.join(' ') : undefined;
     const result = await auth(provider, { serverUrl: cfg.url, scope });
     if (result !== 'REDIRECT' || !target) throw new Error(`sign-in to "${server}" did not ask for authorization (${result})`);
-    const state = target.searchParams.get('state') ?? provider.lastState;
+    const state = target.searchParams.get('state');
     if (!state) throw new Error('the authorization URL has no state parameter');
     for (const [k, v] of this.pending) if (Date.now() - v.at > 15 * 60e3) this.pending.delete(k);
     this.pending.set(state, { server, provider, at: Date.now() });
@@ -205,33 +263,46 @@ export class OAuthFlows {
 
   /** The provider redirected back; exchange the code. Returns the server name. */
   async finish(params: URLSearchParams): Promise<string> {
-    const error = params.get('error');
     const state = params.get('state') ?? '';
     const flow = this.pending.get(state);
     if (!flow) throw new Error('unknown or expired sign-in (state mismatch) — start again');
     this.pending.delete(state);
-    if (error) throw new Error(`${flow.server}: ${error}${params.get('error_description') ? ` — ${params.get('error_description')}` : ''}`);
-    const code = params.get('code');
-    if (!code) throw new Error('the provider sent no authorization code');
-    const cfg = this.config(flow.server);
-    const result = await auth(flow.provider, { serverUrl: cfg.url, authorizationCode: code });
-    if (result !== 'AUTHORIZED') throw new Error(`token exchange for "${flow.server}" failed`);
-    this.storage.set(flow.server, { ...this.storage.get(flow.server), verifier: undefined });
-    this.onSignedIn(flow.server);
+    try {
+      const error = params.get('error');
+      if (error) throw new Error(`${flow.server}: ${error}${params.get('error_description') ? ` — ${params.get('error_description')}` : ''}`);
+      const code = params.get('code');
+      if (!code) throw new Error('the provider sent no authorization code');
+      const result = await auth(flow.provider, { serverUrl: this.config(flow.server).url, authorizationCode: code });
+      if (result !== 'AUTHORIZED') throw new Error(`token exchange for "${flow.server}" failed`);
+    } catch (err) {
+      this.results.set(flow.server, { at: Date.now(), ok: false, error: (err as Error).message });
+      throw err;
+    }
+    this.results.set(flow.server, { at: Date.now(), ok: true });
+    this.onChange(flow.server);
     return flow.server;
   }
 
   signOut(server: string) {
     this.config(server);
     this.storage.delete(server);
-    this.onSignedIn(server);
+    this.onChange(server);
   }
 
-  /** Handles /oauth/start/<server> and /oauth/callback; false for other paths. */
+  /**
+   * Handles /oauth/start/<server> and /oauth/callback; false for other paths.
+   * Starting is only allowed from a navigation the user made (address bar, `bridge auth`, or the
+   * dashboard): another site embedding the URL must not be able to begin flows.
+   */
   async handle(req: IncomingMessage, res: ServerResponse, url: URL, done?: (server: string, err?: Error) => void): Promise<boolean> {
     if (req.method !== 'GET') return false;
     const start = /^\/oauth\/start\/([\w.-]+)$/.exec(url.pathname);
     if (start) {
+      const site = req.headers['sec-fetch-site'];
+      if (site !== 'same-origin' && site !== 'none') {
+        page(res, 403, 'Sign-in not started', 'Open the sign-in from the bridge dashboard or with `bridge auth <server>`.');
+        return true;
+      }
       try {
         const target = await this.start(start[1]!);
         res.writeHead(302, { location: target.toString() }).end();

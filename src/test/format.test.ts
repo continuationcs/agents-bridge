@@ -1,12 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { toSlackMrkdwn, width } from '../src/adapters/im/slack-format.ts';
-import { split } from '../src/core/bridge.ts';
+import { toSlackMrkdwn, truncateMrkdwn, width } from '../adapters/im/slack-format.ts';
+import { isPersonMessage } from '../adapters/im/slack.ts';
+import { split } from '../core/bridge.ts';
 
 test('inline formatting', () => {
   assert.equal(toSlackMrkdwn('**bold** and *it* and ~~gone~~'), '*bold* and _it_ and ~gone~');
   assert.equal(toSlackMrkdwn('see [docs](https://x.dev/a?b=1&c=2)'), 'see <https://x.dev/a?b=1&amp;c=2|docs>');
-  assert.equal(toSlackMrkdwn('a < b && `x **not bold** <y>`'), 'a &lt; b &amp;&amp; `x **not bold** <y>`');
+  assert.equal(toSlackMrkdwn('a < b && `x **not bold** <y>`'), 'a &lt; b &amp;&amp; `x **not bold** &lt;y&gt;`');
   assert.equal(toSlackMrkdwn('2 * 3 * 4'), '2 * 3 * 4');
 });
 
@@ -17,8 +18,41 @@ test('block formatting', () => {
   assert.equal(toSlackMrkdwn('---'), '──────────');
 });
 
-test('code fences are untouched and lose the language tag', () => {
+test('code fences keep their text (escaped) and lose the language tag', () => {
   assert.equal(toSlackMrkdwn('```ts\nconst a = **b**;\n```'), '```\nconst a = **b**;\n```');
+  assert.equal(
+    toSlackMrkdwn('```\nconst m: Map<string, number> = a && b;\n<!channel>\n```'),
+    '```\nconst m: Map&lt;string, number&gt; = a &amp;&amp; b;\n&lt;!channel&gt;\n```',
+  );
+  assert.equal(toSlackMrkdwn('ping `<!here>`'), 'ping `&lt;!here&gt;`');
+});
+
+test('grid table cells and record labels are escaped too', () => {
+  assert.equal(toSlackMrkdwn('| a<b | c |\n|---|---|\n| x&y | <z> |'), ['```', 'a&lt;b  c', '───  ───', 'x&amp;y  &lt;z&gt;', '```'].join('\n'));
+  const wide = `| k | <label> |\n|---|---|\n| row | ${'v'.repeat(70)} |`;
+  assert.match(toSlackMrkdwn(wide), /• &lt;label&gt;: v+/);
+});
+
+test('block text is cut below the limit without leaving a code fence or entity open', () => {
+  const long = 'intro\n```\n' + Array.from({ length: 400 }, (_, i) => `line ${i} &amp;`).join('\n') + '\n```';
+  const cut = truncateMrkdwn(long, 3000);
+  assert.ok(cut.length <= 3000, String(cut.length));
+  assert.equal((cut.match(/```/g) ?? []).length % 2, 0, 'fence closed');
+  assert.ok(cut.endsWith('```\n…'));
+  const oneLine = truncateMrkdwn('x'.repeat(2990) + ' &amp; more text here', 3000);
+  assert.ok(oneLine.length <= 3000);
+  assert.doesNotMatch(oneLine, /&[a-z]*\n…$/, 'no half entity');
+  assert.equal(truncateMrkdwn('short', 3000), 'short');
+});
+
+test('slack: thread replies also sent to the channel are messages; edits, bots and the bot itself are not', () => {
+  assert.ok(isPersonMessage({ user: 'U1', text: 'hi' }, 'UB'));
+  assert.ok(isPersonMessage({ user: 'U1', subtype: 'file_share' }, 'UB'));
+  assert.ok(isPersonMessage({ user: 'U1', subtype: 'thread_broadcast', thread_ts: '1.0' }, 'UB'));
+  assert.ok(!isPersonMessage({ user: 'U1', subtype: 'message_changed' }, 'UB'));
+  assert.ok(!isPersonMessage({ user: 'U1', bot_id: 'B1' }, 'UB'));
+  assert.ok(!isPersonMessage({ user: 'UB' }, 'UB'));
+  assert.ok(!isPersonMessage(undefined, 'UB'));
 });
 
 test('tables become aligned monospace, CJK counted double', () => {

@@ -4,12 +4,12 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { parseConfig } from '../src/config/load.ts';
-import { Bridge } from '../src/core/bridge.ts';
-import { newEnvelope } from '../src/core/envelope.ts';
-import { Store } from '../src/core/store.ts';
-import type { AgentAdapter, AgentTurn } from '../src/adapters/agent/types.ts';
-import { ensureWorktree } from '../src/adapters/agent/worktree.ts';
+import { parseConfig } from '../config/load.ts';
+import { Bridge } from '../core/bridge.ts';
+import { newEnvelope } from '../core/envelope.ts';
+import { Store } from '../core/store.ts';
+import type { AgentAdapter, AgentTurn } from '../adapters/agent/types.ts';
+import { ensureWorktree } from '../adapters/agent/worktree.ts';
 import { FakeIm } from './helpers.ts';
 
 const cfg = parseConfig(`
@@ -63,7 +63,7 @@ test('a turn interrupted too often is given up', async () => {
   assert.match(im.transcript().join('\n'), /interrupted 3 times/);
 });
 
-test('each session gets its own worktree and branch, reused across turns', () => {
+test('each session gets its own worktree and branch, reused across turns', async () => {
   const repo = realpathSync(mkdtempSync(join(tmpdir(), 'ab-repo-')));
   const git = (...a: string[]) => execFileSync('git', a, { cwd: repo, stdio: 'pipe' });
   git('init', '-q', '-b', 'main');
@@ -74,9 +74,9 @@ test('each session gets its own worktree and branch, reused across turns', () =>
   git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'init');
   const dir = join(repo, '..', `wt-${Date.now()}`);
 
-  const a = ensureWorktree({ baseCwd: join(repo, 'pkg'), sessionKey: 'slack:C1:T1', dir, links: ['node_modules'] });
-  const b = ensureWorktree({ baseCwd: join(repo, 'pkg'), sessionKey: 'slack:C1:T2', dir });
-  const again = ensureWorktree({ baseCwd: join(repo, 'pkg'), sessionKey: 'slack:C1:T1', dir });
+  const a = await ensureWorktree({ baseCwd: join(repo, 'pkg'), sessionKey: 'slack:C1:T1', dir, links: ['node_modules'] });
+  const b = await ensureWorktree({ baseCwd: join(repo, 'pkg'), sessionKey: 'slack:C1:T2', dir });
+  const again = await ensureWorktree({ baseCwd: join(repo, 'pkg'), sessionKey: 'slack:C1:T1', dir });
 
   assert.ok(a.created && b.created && !again.created);
   assert.notEqual(a.path, b.path);
