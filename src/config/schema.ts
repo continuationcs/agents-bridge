@@ -82,8 +82,8 @@ const StdioAgent = z
 export const AgentConfig = z.discriminatedUnion('type', [ClaudeCodeAgent, WebhookAgent, StdioAgent]);
 export type AgentConfig = z.infer<typeof AgentConfig>;
 
-/** An external tool server the bridge proxies (MCP over stdio). */
-const ToolServer = z
+/** An external tool server the bridge proxies: a local MCP process (stdio)… */
+const StdioToolServer = z
   .object({
     type: z.literal('mcp').default('mcp'),
     command: z.string(),
@@ -92,7 +92,22 @@ const ToolServer = z
     description: z.string().optional(),
   })
   .strict();
+
+/** …or a remote one over HTTP. Header values may be "secret:x", "env:X" or contain ${secret:x} / ${env:X}. */
+const HttpToolServer = z
+  .object({
+    type: z.literal('mcp').default('mcp'),
+    url: z.url(),
+    /** streamable-http (current spec) or sse (older servers); auto tries streamable-http, then sse. */
+    transport: z.enum(['auto', 'streamable-http', 'sse']).default('auto'),
+    headers: z.record(z.string(), z.string()).default({}),
+    description: z.string().optional(),
+  })
+  .strict();
+
+const ToolServer = z.union([StdioToolServer, HttpToolServer]);
 export type ToolServerConfig = z.infer<typeof ToolServer>;
+export type HttpToolServerConfig = z.infer<typeof HttpToolServer>;
 
 const OneOrMany = z.union([z.string(), z.array(z.string()).min(1)]);
 

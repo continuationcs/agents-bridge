@@ -29,6 +29,14 @@ export function resolveSecret(ref: string): string {
   return ref;
 }
 
+/** A value that is a secret ref ("secret:x" / "env:X"), or a string with ${secret:x} / ${env:X} inside. */
+export function resolveTemplate(value: string): string {
+  if (/\$\{(secret|env):[^}]+\}/.test(value)) {
+    return value.replace(/\$\{((?:secret|env):[^}]+)\}/g, (_, ref: string) => resolveSecret(ref));
+  }
+  return resolveSecret(value);
+}
+
 export function setSecret(name: string, value: string) {
   if (process.platform !== 'darwin') {
     throw new Error(`no keychain support on ${process.platform} yet — export ${envName(name)} instead`);

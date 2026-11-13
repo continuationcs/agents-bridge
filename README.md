@@ -37,6 +37,7 @@ agents:
   data-agent:  { type: webhook, url: http://localhost:8080/agent }
 tools:
   github: { command: npx, args: ["-y", "@modelcontextprotocol/server-github"], env: { GITHUB_PERSONAL_ACCESS_TOKEN: secret:github_token } }
+  search: { url: https://mcp.example.com/mcp, headers: { Authorization: "Bearer ${secret:search_api_key}" } }
 routes:
   - from: slack:#dev
     when: { mention: claude-code, sender: [alice] }
@@ -114,6 +115,12 @@ node dist/cli.js worktrees prune --older-than 7d    # remove idle ones with noth
 - An agent route (`from: <agent>`) lists what that agent may reach: other agents, and tools as `server.tool` globs.
 - `reset` / `/new` starts a fresh agent session for the thread. A DM session resets after `dm_idle_reset`.
 
+## Tool servers
+
+- **Local** (`command`, `args`, `env`): the bridge starts the MCP server as a child process and talks stdio.
+- **Remote** (`url`, `headers`): Streamable HTTP, falling back to the older SSE transport (`transport: auto | streamable-http | sse`). A header value can be a whole secret ref (`secret:x`, `env:X`) or contain `${secret:x}` / `${env:X}`, e.g. `"Bearer ${secret:search_api_key}"`. OAuth sign-in flows are not supported yet: use servers that accept an API key or token in a header.
+- A dropped connection or expired remote session is reconnected once per call. `agents-bridge doctor` lists each server's tools.
+
 ## Agent protocols
 
 **Webhook**: `POST <url>` with `{"type":"turn","text","session_id","budget_usd","envelope","mcp":{"url"}}` (`budget_usd` is what is left of the conversation budget, or null). Respond with `{"text","session_id"?,"cost_usd"?}`.
@@ -133,7 +140,7 @@ src/
   core/bridge.ts         inbound → queue → agent turn → reply; MCP tool backend
   core/store.ts          SQLite: sessions, queue, trace (redacted)
   mcp/hub.ts             per-turn MCP endpoints over streamable HTTP
-  mcp/tools.ts           external MCP tool servers (stdio)
+  mcp/tools.ts           external MCP tool servers (stdio or HTTP)
   adapters/im/           slack, telegram, local console
   adapters/agent/        claude-code, webhook, stdio
 ```
