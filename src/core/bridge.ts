@@ -147,6 +147,7 @@ export class Bridge implements HubBackend {
       void agent.stop?.();
       this.agents.delete(name);
     }
+    void this.tools.update(cfg.tools);
     this.log('config reloaded');
   }
 

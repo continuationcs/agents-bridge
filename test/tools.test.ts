@@ -96,3 +96,24 @@ tools:
   bad: { command: x, url: "http://localhost/mcp" }
 `));
 });
+
+test('config reload adds new tool servers and drops removed ones', async () => {
+  const srv = await httpToolServer('t');
+  const hub = new ToolHub({});
+  try {
+    assert.deepEqual(hub.serverNames(), []);
+    const cfg = parseConfig(`
+version: 1
+tools:
+  remote: { url: ${srv.url}, headers: { Authorization: Bearer t } }
+`);
+    await hub.update(cfg.tools);
+    assert.equal((await hub.listTools('remote')).length, 1);
+    await hub.update({});
+    assert.deepEqual(hub.serverNames(), []);
+    await assert.rejects(hub.listTools('remote'), /unknown tool server/);
+  } finally {
+    await hub.stop();
+    await srv.close();
+  }
+});

@@ -16,12 +16,23 @@ export interface ProxiedTool {
  * credentials and re-exposes the tools each agent's routes allow.
  */
 export class ToolHub {
-  private readonly servers: Record<string, ToolServerConfig>;
+  private servers: Record<string, ToolServerConfig>;
   private readonly clients = new Map<string, Promise<Client>>();
   private readonly toolCache = new Map<string, Tool[]>();
 
   constructor(servers: Record<string, ToolServerConfig>) {
     this.servers = servers;
+  }
+
+  /** Config reload: new servers become available; changed or removed ones are disconnected. */
+  async update(servers: Record<string, ToolServerConfig>) {
+    const old = this.servers;
+    this.servers = servers;
+    for (const name of Object.keys(old)) {
+      if (JSON.stringify(old[name]) === JSON.stringify(servers[name])) continue;
+      this.toolCache.delete(name);
+      await this.drop(name);
+    }
   }
 
   serverNames(): string[] {
